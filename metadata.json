@@ -1,0 +1,7 @@
+{
+  "name": "Marble Skill Taxonomy Explorer",
+  "description": "An interactive prerequisite explorer and curriculum standards alignment index for primary & elementary learning.",
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
