@@ -7,6 +7,30 @@
   "license": "(ODbL-1.0 AND CC-BY-SA-4.0)",
   "homepage": "https://withmarble.com",
   "scripts": {
-    "validate": "node scripts/validate.mjs"
+    "dev": "vite --host 0.0.0.0 --port 3000",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 3000",
+    "validate": "node scripts/validate.mjs",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@types/three": "^0.185.1",
+    "d3": "^7.9.0",
+    "lucide-react": "^1.23.0",
+    "motion": "^12.42.2",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "recharts": "^3.9.2",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.2",
+    "@types/d3": "^7.4.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.4"
   }
 }
