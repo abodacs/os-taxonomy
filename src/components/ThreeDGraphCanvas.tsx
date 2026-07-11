@@ -35,6 +35,28 @@ const HOVER_DWELL_MS = 120;
 // Gap between the anchor node and the hover card, in CSS pixels.
 const TOOLTIP_GAP_PX = 14;
 
+// Pure placement decision for the tooltip card: prefer above the anchor node,
+// flip below if it would clip the top edge and there's room beneath, and clamp
+// horizontally so it stays within the canvas. Has no DOM or ref dependencies —
+// extracted from the render loop so it stays testable and the loop stays lean.
+function placeTooltip(
+  anchorX: number,
+  anchorY: number,
+  cardW: number,
+  cardH: number,
+  viewW: number,
+  viewH: number
+): { left: number; top: number; transform: string } {
+  const placeBelow = anchorY - TOOLTIP_GAP_PX - cardH < 0
+    && anchorY + TOOLTIP_GAP_PX + cardH <= viewH;
+  const left = Math.max(cardW / 2, Math.min(viewW - cardW / 2, anchorX));
+  return {
+    left,
+    top: anchorY + (placeBelow ? TOOLTIP_GAP_PX : -TOOLTIP_GAP_PX),
+    transform: placeBelow ? "translate(-50%, 0%)" : "translate(-50%, -100%)"
+  };
+}
+
 export default function ThreeDGraphCanvas({
   activeTopic,
   onSelectTopic,
@@ -1132,21 +1154,16 @@ export default function ThreeDGraphCanvas({
 
             // Measure: re-measure whenever the shown topic changes (text length
             // drives height) or after a re-show. Cached per topic per show.
-            const dims = tooltipDimsRef.current;
+            let dims = tooltipDimsRef.current;
             if (!dims || dims.id !== currentHovered.id) {
-              tooltipDimsRef.current = { id: currentHovered.id, w: tooltipEl.offsetWidth, h: tooltipEl.offsetHeight };
+              dims = { id: currentHovered.id, w: tooltipEl.offsetWidth, h: tooltipEl.offsetHeight };
+              tooltipDimsRef.current = dims;
             }
-            const measured = tooltipDimsRef.current!;
-            // Prefer placing above the node; flip below if it would clip the
-            // top edge and there's room beneath. Clamp horizontally to the canvas.
-            const placeBelow = proj.sy - TOOLTIP_GAP_PX - measured.h < 0
-              && proj.sy + TOOLTIP_GAP_PX + measured.h <= cssH;
-            const left = Math.max(measured.w / 2, Math.min(cssW - measured.w / 2, proj.sx));
-            tooltipEl.style.left = `${left}px`;
-            tooltipEl.style.top = `${proj.sy + (placeBelow ? TOOLTIP_GAP_PX : -TOOLTIP_GAP_PX)}px`;
-            tooltipEl.style.transform = placeBelow
-              ? "translate(-50%, 0%)"
-              : "translate(-50%, -100%)";
+            // Placement is a pure decision (see placeTooltip); apply it here.
+            const place = placeTooltip(proj.sx, proj.sy, dims.w, dims.h, cssW, cssH);
+            tooltipEl.style.left = `${place.left}px`;
+            tooltipEl.style.top = `${place.top}px`;
+            tooltipEl.style.transform = place.transform;
             tooltipEl.style.opacity = "1";
           } else {
             tooltipEl.style.opacity = "0";
