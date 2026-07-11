@@ -1,4 +1,4 @@
-import { Topic, Dependency, Standard, Curriculum, Cluster, TaxonomyManifest } from "./types";
+import { Topic, Dependency, Curriculum, Cluster, TaxonomyManifest } from "./types";
 import topicsData from "../data/topics.json";
 import dependenciesData from "../data/dependencies.json";
 import standardsData from "../data/curriculum-standards.json";
@@ -36,80 +36,38 @@ for (const dep of dependenciesList) {
   unlockAdjacencyList.get(dep.prerequisiteId)!.push(dep);
 }
 
-// Flat standards registry for quick lookup by key
-export const standardsMap = new Map<string, { standard: Standard; curriculum: Curriculum }>();
-for (const curr of curriculaList) {
-  for (const std of curr.topics) {
-    standardsMap.set(std.key, { standard: std, curriculum: curr });
+// Internal: DFS traversal over an adjacency list. Shared by the two transitive
+// helpers below — the only difference is which adjacency list and which end
+// of each Dependency edge is the neighbor.
+function traverseTransitive(
+  startId: string,
+  adjacency: Map<string, Dependency[]>,
+  getNeighborId: (dep: Dependency) => string
+): { topic: Topic; distance: number }[] {
+  const visited = new Set<string>();
+  const list: { topic: Topic; distance: number }[] = [];
+
+  function walk(currentId: string, depth: number) {
+    const deps = adjacency.get(currentId) || [];
+    for (const dep of deps) {
+      const neighborId = getNeighborId(dep);
+      if (!visited.has(neighborId)) {
+        visited.add(neighborId);
+        walk(neighborId, depth + 1);
+        const topic = topicsMap.get(neighborId);
+        if (topic) list.push({ topic, distance: depth + 1 });
+      }
+    }
   }
-}
 
-// Helper: Get a single topic by ID
-export function getTopic(id: string): Topic | undefined {
-  return topicsMap.get(id);
-}
-
-// Helper: Get direct prerequisites
-export function getDirectPrerequisites(id: string): { topic: Topic; dependency: Dependency }[] {
-  const deps = prereqAdjacencyList.get(id) || [];
-  return deps
-    .map(d => {
-      const t = topicsMap.get(d.prerequisiteId);
-      return t ? { topic: t, dependency: d } : null;
-    })
-    .filter((x): x is { topic: Topic; dependency: Dependency } => x !== null);
-}
-
-// Helper: Get direct unlocks
-export function getDirectUnlocks(id: string): { topic: Topic; dependency: Dependency }[] {
-  const deps = unlockAdjacencyList.get(id) || [];
-  return deps
-    .map(d => {
-      const t = topicsMap.get(d.topicId);
-      return t ? { topic: t, dependency: d } : null;
-    })
-    .filter((x): x is { topic: Topic; dependency: Dependency } => x !== null);
+  walk(startId, 0);
+  return list;
 }
 
 // Helper: Compute transitive prerequisites (full sub-DAG)
 // Returns list of unique topic IDs in topological order (bottom-up: prerequisites first)
 export function getTransitivePrerequisites(id: string): { topic: Topic; distance: number }[] {
-  const visited = new Set<string>();
-  const list: { topic: Topic; distance: number }[] = [];
-
-  function traverse(currentId: string, depth: number) {
-    const direct = getDirectPrerequisites(currentId);
-    for (const { topic } of direct) {
-      if (!visited.has(topic.id)) {
-        visited.add(topic.id);
-        traverse(topic.id, depth + 1);
-        list.push({ topic, distance: depth + 1 });
-      }
-    }
-  }
-
-  traverse(id, 0);
-  return list;
-}
-
-// Helper: Compute transitive unlocks (everything this topic unlocks down the line)
-export function getTransitiveUnlocks(id: string): { topic: Topic; distance: number }[] {
-  const visited = new Set<string>();
-  const list: { topic: Topic; distance: number }[] = [];
-
-  function traverse(currentId: string, depth: number) {
-    const direct = getDirectUnlocks(currentId);
-    for (const { topic } of direct) {
-      if (!visited.has(topic.id)) {
-        visited.add(topic.id);
-        traverse(topic.id, depth + 1);
-        list.push({ topic, distance: depth + 1 });
-      }
-    }
-  }
-
-  traverse(id, 0);
-  return list;
+  return traverseTransitive(id, prereqAdjacencyList, dep => dep.prerequisiteId);
 }
 
 // Helper: Get cluster summary for a topic

@@ -7,25 +7,51 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
-/* Custom styles if any */
+/*
+ * Base body matches the app's dark theme so there is no light→dark flash on
+ * load. index.html previously declared bg-slate-50/text-slate-900 (light),
+ * which flashed before the React root mounted.
+ */
 body {
   font-family: var(--font-sans);
-  background-color: #f8fafc;
-  color: #0f172a;
+  background-color: #03060f;
+  color: #e2e8f0;
 }
 
-/* Smooth custom scrollbars */
-::-webkit-scrollbar {
+/*
+ * Custom thin scrollbars for the dark HUD panels. Applied via the
+ * `custom-scrollbar` utility class (used by the sidebar body and scrollable
+ * lists) so default scrollbars elsewhere are unaffected.
+ */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #475569 transparent;
+}
+.custom-scrollbar::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
-::-webkit-scrollbar-track {
+.custom-scrollbar::-webkit-scrollbar-track {
   background: transparent;
 }
-::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #475569;
   border-radius: 3px;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Respect users who prefer reduced motion — the 3D graph's auto-rotate and
+   pulsing halos are toggled off by default; this ensures any transitions also
+   yield. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
