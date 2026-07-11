@@ -28,6 +28,13 @@ const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) =>
     c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;");
 
+// How long the cursor must rest on a node before the hover card appears.
+// Long enough to suppress strobing when sweeping a dense cluster, short
+// enough to feel instant on a deliberate stop.
+const HOVER_DWELL_MS = 120;
+// Gap between the anchor node and the hover card, in CSS pixels.
+const TOOLTIP_GAP_PX = 14;
+
 export default function ThreeDGraphCanvas({
   activeTopic,
   onSelectTopic,
@@ -83,12 +90,20 @@ export default function ThreeDGraphCanvas({
   const touchStartPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const pinchStartDistRef = useRef<number>(0);
   const zoomStartValRef = useRef<number>(1.85);
-  // Timer for the mobile tap-tooltip flash; tracked so a new tap can clear a
-  // stale timer instead of prematurely clearing a legitimate hover state.
-  const touchTooltipTimerRef = useRef<number | null>(null);
+
+  // Hover-intent dwell: record the candidate node + the timestamp it first
+  // became a candidate, and only commit the hover after a short dwell. This
+  // kills the text-strobe when sweeping a dense cluster without adding
+  // perceptible latency on a real stop.
+  const hoverDwellRef = useRef<{ id: string | null; since: number }>({ id: null, since: 0 });
 
   // Hover state
   const [hoveredTopic, setHoveredTopic] = useState<Topic | null>(null);
+  // Touch-pinned topic: the node a mobile tap selected. Unlike hover, this
+  // persists until the next pan, empty-tap, or deselect (see handleTouch* and
+  // the effect below) — replacing the old fixed 1500ms flash. The render loop
+  // shows it via the tooltip card whenever there is no mouse hover.
+  const [touchPinnedTopic, setTouchPinnedTopic] = useState<Topic | null>(null);
 
   // Calculate connection counts for centrality
   const nodeCentrality = useMemo(() => {
@@ -276,6 +291,11 @@ export default function ThreeDGraphCanvas({
   // Sync reactive properties into refs for render loop access without re-instantiation
   const activeTopicRef = useRef(activeTopic);
   const hoveredTopicRef = useRef(hoveredTopic);
+  const touchPinnedTopicRef = useRef(touchPinnedTopic);
+  // Cached measured card size, re-measured when the shown topic changes
+  // (content drives height) and cleared on hide. Used for viewport collision
+  // handling (flip/clamp) in the render loop.
+  const tooltipDimsRef = useRef<{ id: string; w: number; h: number } | null>(null);
   const hiddenSubjectsRef = useRef(hiddenSubjects);
   const nodesRef = useRef(nodes);
   const selectedPrereqIdsRef = useRef(selectedPrereqIds);
@@ -288,6 +308,7 @@ export default function ThreeDGraphCanvas({
   useEffect(() => {
     activeTopicRef.current = activeTopic;
     hoveredTopicRef.current = hoveredTopic;
+    touchPinnedTopicRef.current = touchPinnedTopic;
     hiddenSubjectsRef.current = hiddenSubjects;
     nodesRef.current = nodes;
     selectedPrereqIdsRef.current = selectedPrereqIds;
@@ -295,7 +316,15 @@ export default function ThreeDGraphCanvas({
     onDeselectRef.current = onDeselectTopic;
     labeledNodeIdsRef.current = labeledNodeIds;
     nodeByTopicIdRef.current = nodeByTopicId;
-  }, [activeTopic, hoveredTopic, hiddenSubjects, nodes, selectedPrereqIds, autoRotate, onDeselectTopic, labeledNodeIds, nodeByTopicId]);
+  }, [activeTopic, hoveredTopic, touchPinnedTopic, hiddenSubjects, nodes, selectedPrereqIds, autoRotate, onDeselectTopic, labeledNodeIds, nodeByTopicId]);
+
+  // Clear the touch-pinned card whenever the selection is cleared by any path
+  // (e.g. the sidebar's close button). A no-op when a new selection arrives,
+  // since activeTopic is then truthy. Keeps the pinned preview in sync with
+  // what is actually selected.
+  useEffect(() => {
+    if (activeTopic === null) setTouchPinnedTopic(null);
+  }, [activeTopic]);
 
   // High-performance CPU update for size/alpha attributes, transitioning values smoothly
   const updateNodeAttributes = (forceImmediate = false) => {
@@ -991,13 +1020,21 @@ export default function ThreeDGraphCanvas({
         }
 
         if (closestNode) {
-          if (hoveredTopicRef.current?.id !== closestNode.topic.id) {
-            setHoveredTopic(closestNode.topic);
-          }
+          // Cursor feedback is immediate; the hover card waits for a short
+          // dwell so sweeping across a dense cluster doesn't strobe its text.
           if (!isDragging.current && canvas.style.cursor !== "pointer") {
             canvas.style.cursor = "pointer";
           }
+          const candId = closestNode.topic.id;
+          const dwell = hoverDwellRef.current;
+          if (dwell.id !== candId) {
+            dwell.id = candId;
+            dwell.since = performance.now();
+          } else if (hoveredTopicRef.current?.id !== candId && performance.now() - dwell.since >= HOVER_DWELL_MS) {
+            setHoveredTopic(closestNode.topic);
+          }
         } else {
+          hoverDwellRef.current = { id: null, since: 0 };
           if (hoveredTopicRef.current !== null) {
             setHoveredTopic(null);
           }
@@ -1062,21 +1099,21 @@ export default function ThreeDGraphCanvas({
       // Update hover detail card position + content. Card is always mounted;
       // we toggle opacity and write content imperatively from the latest
       // hovered topic each frame (avoids React re-renders and first-frame
-      // flash at 0,0).
-      const currentHovered = hoveredTopicRef.current;
-      if (tooltipRef.current) {
+      // flash at 0,0). Mouse hover takes priority; otherwise the touch-pinned
+      // topic (a mobile tap selection) is shown until cleared.
+      const currentHovered = hoveredTopicRef.current ?? touchPinnedTopicRef.current;
+      const tooltipEl = tooltipRef.current;
+      if (tooltipEl) {
         if (currentHovered) {
           const proj = projectedCoordsRef.current.find(p => p.topic.id === currentHovered.id);
           if (proj) {
-            tooltipRef.current.style.left = `${proj.sx}px`;
-            tooltipRef.current.style.top = `${proj.sy - 18}px`;
-            tooltipRef.current.style.opacity = "1";
             // Populate card content (only rewrite text when the node changed).
             const hoverColor = subjectColor(currentHovered.subject);
             if (tooltipBarRef.current) tooltipBarRef.current.style.backgroundColor = hoverColor;
             if (tooltipDomainRef.current && tooltipDomainRef.current.dataset.id !== currentHovered.id) {
               tooltipDomainRef.current.dataset.id = currentHovered.id;
-              tooltipDomainRef.current.style.color = hoverColor;
+              // Domain label stays a fixed neutral; the color bar is the sole
+              // subject signal (neon text reads as a debug overlay + is harsh).
               tooltipDomainRef.current.textContent = currentHovered.domain;
             }
             if (tooltipAgeRef.current && tooltipAgeRef.current.dataset.id !== currentHovered.id) {
@@ -1089,18 +1126,35 @@ export default function ThreeDGraphCanvas({
             }
             if (tooltipDescRef.current && tooltipDescRef.current.dataset.id !== currentHovered.id) {
               tooltipDescRef.current.dataset.id = currentHovered.id;
-              // Short description: first sentence, capped.
-              const desc = currentHovered.description || "";
-              const firstSentence = desc.split(/(?<=[.!?])\s/)[0] || desc;
-              tooltipDescRef.current.textContent = firstSentence.length > 140
-                ? firstSentence.slice(0, 137) + "…"
-                : firstSentence;
+              // One truncation layer: the CSS line-clamp-2 handles the ellipsis.
+              tooltipDescRef.current.textContent = currentHovered.description || "";
             }
+
+            // Measure: re-measure whenever the shown topic changes (text length
+            // drives height) or after a re-show. Cached per topic per show.
+            const dims = tooltipDimsRef.current;
+            if (!dims || dims.id !== currentHovered.id) {
+              tooltipDimsRef.current = { id: currentHovered.id, w: tooltipEl.offsetWidth, h: tooltipEl.offsetHeight };
+            }
+            const measured = tooltipDimsRef.current!;
+            // Prefer placing above the node; flip below if it would clip the
+            // top edge and there's room beneath. Clamp horizontally to the canvas.
+            const placeBelow = proj.sy - TOOLTIP_GAP_PX - measured.h < 0
+              && proj.sy + TOOLTIP_GAP_PX + measured.h <= cssH;
+            const left = Math.max(measured.w / 2, Math.min(cssW - measured.w / 2, proj.sx));
+            tooltipEl.style.left = `${left}px`;
+            tooltipEl.style.top = `${proj.sy + (placeBelow ? TOOLTIP_GAP_PX : -TOOLTIP_GAP_PX)}px`;
+            tooltipEl.style.transform = placeBelow
+              ? "translate(-50%, 0%)"
+              : "translate(-50%, -100%)";
+            tooltipEl.style.opacity = "1";
           } else {
-            tooltipRef.current.style.opacity = "0";
+            tooltipEl.style.opacity = "0";
+            tooltipDimsRef.current = null;
           }
         } else {
-          tooltipRef.current.style.opacity = "0";
+          tooltipEl.style.opacity = "0";
+          tooltipDimsRef.current = null;
         }
       }
 
@@ -1455,6 +1509,13 @@ export default function ThreeDGraphCanvas({
       const dx = touch.clientX - dragStart.current.x;
       const dy = touch.clientY - dragStart.current.y;
 
+      // Panning clears the touch-pinned preview card: a drag is no longer a
+      // "look at this node" gesture, so the card shouldn't linger on the old one.
+      const movedFromStart = Math.hypot(touch.clientX - touchStartPosRef.current.x, touch.clientY - touchStartPosRef.current.y);
+      if (movedFromStart >= 15 && touchPinnedTopicRef.current !== null) {
+        setTouchPinnedTopic(null);
+      }
+
       targetRotation.current.y = rotation.current.y + dx * 0.009;
       targetRotation.current.x = Math.max(
         -Math.PI / 2 + 0.1,
@@ -1514,18 +1575,14 @@ export default function ThreeDGraphCanvas({
 
         if (closestNode) {
           onSelectTopic(closestNode.topic);
-          // Briefly display HUD tooltip for mobile tap acknowledgment.
-          // Clear any prior timer so a new tap can't be wiped by a stale one.
-          if (touchTooltipTimerRef.current !== null) {
-            window.clearTimeout(touchTooltipTimerRef.current);
-          }
-          setHoveredTopic(closestNode.topic);
-          touchTooltipTimerRef.current = window.setTimeout(() => {
-            setHoveredTopic(null);
-            touchTooltipTimerRef.current = null;
-          }, 1500);
+          // Pin the preview card to the tapped node. It persists until the next
+          // pan, empty-tap, or deselect (see handleTouchMove / handleTouchEnd /
+          // the activeTopic effect) — replacing the old fixed 1500ms flash,
+          // which was too short to read and redundant with the sidebar.
+          setTouchPinnedTopic(closestNode.topic);
         } else {
-          // Tap on empty space clears the selection.
+          // Tap on empty space clears the selection and the pinned card.
+          setTouchPinnedTopic(null);
           onDeselectRef.current?.();
         }
       }
@@ -1561,6 +1618,7 @@ export default function ThreeDGraphCanvas({
           isDragging.current = false;
           pressActive.current = false;
           mousePosRef.current = null;
+          hoverDwellRef.current = { id: null, since: 0 };
           if (canvasRef.current) canvasRef.current.style.cursor = "default";
           setHoveredTopic(null);
         }}
@@ -1603,39 +1661,46 @@ export default function ThreeDGraphCanvas({
         </button>
       </div>
 
-      {/* Hover detail card.
-          Always mounted to avoid a first-frame flash at (0,0); opacity is
-          toggled imperatively from the render loop. Content (domain chip,
-          age, title, description) is written imperatively each frame so the
-          latest hovered node's full data shows without React re-renders.
-          aria-hidden: this duplicates sidebar content; the canvas itself
-          carries the text alternative for assistive tech. */}
+      {/* Hover / tap detail card.
+          Always mounted to avoid a first-frame flash at (0,0); opacity and
+          position are toggled imperatively from the render loop. Content
+          (domain, age, title, description) is written imperatively each frame
+          so the latest hovered or touch-pinned node's data shows without React
+          re-renders.
+          aria-hidden: the canvas aria-label is a generic graph description
+          (not node-specific), so this transient sighted-only preview is
+          intentionally hidden from AT. Keyboard and screen-reader users
+          browse nodes via the sidebar catalog, which is the accessible path. */}
       <div
         ref={tooltipRef}
         aria-hidden="true"
         className="absolute pointer-events-none z-50 select-none transition-opacity duration-150"
-        style={{ transform: "translate(-50%, -100%)", left: 0, top: 0, opacity: 0, minWidth: "200px", maxWidth: "260px" }}
+        style={{ transform: "translate(-50%, -100%)", left: 0, top: 0, opacity: 0, minWidth: "180px", width: "max-content", maxWidth: "260px" }}
       >
         <div className="rounded-lg overflow-hidden shadow-[0_8px_32px_rgba(0,0,0,0.85)] bg-slate-950/95 border border-white/10">
-          {/* Domain color bar + domain name + age range (row 1) */}
-          <div className="flex items-center gap-2 px-3 py-1.5 border-b border-white/5">
-            <span ref={tooltipBarRef} className="w-1 h-7 rounded-full shrink-0" style={{ backgroundColor: "#94a3b8" }} />
+          {/* Age (lead) + domain, with the subject color bar as the sole hue signal. */}
+          <div className="flex items-center gap-2 px-3 py-2 border-b border-white/10">
+            <span ref={tooltipBarRef} className="w-1 h-8 rounded-full shrink-0" style={{ backgroundColor: "#94a3b8" }} />
             <div className="flex flex-col leading-tight overflow-hidden">
-              <span ref={tooltipDomainRef} className="font-mono text-[9px] font-bold tracking-wider uppercase truncate" style={{ color: "#94a3b8" }}>
-                DOMAIN
-              </span>
-              <span ref={tooltipAgeRef} className="font-mono text-[8.5px] text-slate-400 tracking-wide">
+              <span ref={tooltipAgeRef} className="text-[11px] font-bold text-slate-200 tracking-wide tabular-nums">
                 AGE 4–6
+              </span>
+              <span ref={tooltipDomainRef} className="text-[10px] font-medium uppercase tracking-wide text-slate-400 truncate">
+                DOMAIN
               </span>
             </div>
           </div>
           {/* Title (row 2) */}
-          <div ref={tooltipTitleRef} className="font-sans font-bold text-[13px] text-white leading-snug px-3 pt-2">
+          <div ref={tooltipTitleRef} className="font-sans font-bold text-[13px] text-white leading-snug px-3 pt-2.5">
             Title
           </div>
-          {/* Short description (row 3) */}
-          <div ref={tooltipDescRef} className="font-sans text-[10.5px] text-slate-300 leading-relaxed px-3 pb-2.5 pt-1 line-clamp-2">
+          {/* Short description (row 3) — line-clamp-2 is the single truncation layer. */}
+          <div ref={tooltipDescRef} className="font-sans text-[10.5px] text-slate-300 leading-relaxed px-3 pb-2 pt-1 line-clamp-2">
             Description
+          </div>
+          {/* Affordance: signals that selecting opens the full inspector (sidebar Inspect tab). */}
+          <div className="px-3 py-1.5 border-t border-white/5 text-[9px] text-slate-500 tracking-wide">
+            Inspect →
           </div>
         </div>
       </div>
