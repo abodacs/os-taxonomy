@@ -25,9 +25,30 @@ export interface Dependency {
 export interface Standard {
   key: string;
   code: string;
-  name: string;
-  description?: string;
-  uri?: string;
+  data: {
+    title: string;
+    description?: string;
+    domain?: string;
+    subject?: string;
+    keyStage?: string;
+    yearGroup?: string;
+    year?: string;
+    strand?: string;
+    notesAndGuidance?: string;
+    subjectContentArea?: string;
+    subDomain?: string;
+    discipline?: string;
+    externalId?: string;
+    category?: string;
+    workingScientifically?: string;
+    cluster?: string;
+    subStrand?: string;
+    gradeLevel?: string;
+    standardCode?: string;
+    anchorStandardReference?: string;
+    conceptualCategory?: string;
+    [key: string]: unknown;
+  };
 }
 
 export interface Curriculum {
