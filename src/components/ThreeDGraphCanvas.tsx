@@ -461,17 +461,16 @@ export default function ThreeDGraphCanvas({
             targetSelected = 2.0;
             tr = RGB_BRANCH.r; tg = RGB_BRANCH.g; tb = RGB_BRANCH.b;
           } else {
-            // Unrelated: dim but keep visible as spatial context. The selected
-            // path stands out via full opacity + bright colors; unrelated nodes
-            // stay as faint dots so the graph structure remains legible.
-            targetSize = node.baseRadius * 0.8;
-            targetAlpha = 0.2;
+            // Unrelated: near-invisible per spec §7. The selected sub-DAG
+            // (primary white / branch blue / terminal rose, all at full
+            // opacity) pops against a near-empty field; the faint residual
+            // keeps just enough of the surrounding web for spatial reference.
+            targetSize = node.baseRadius * 0.7;
+            targetAlpha = 0.05;
             targetSelected = 3.0;
-            // Keep the subject color but dimmed — don't switch to near-black
-            // which vanishes on the dark background.
-            tr = colorCache[i].r * 0.3;
-            tg = colorCache[i].g * 0.3;
-            tb = colorCache[i].b * 0.3;
+            tr = colorCache[i].r * 0.15;
+            tg = colorCache[i].g * 0.15;
+            tb = colorCache[i].b * 0.15;
           }
         }
 
