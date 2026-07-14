@@ -428,7 +428,7 @@ export default function ThreeDGraphCanvas({
       const isHidden = currentHiddenSubjects.has(node.topic.subject);
 
       let targetSize = node.baseRadius * 1.0;
-      let targetAlpha = 0.6; // Default medium opacity
+      let targetAlpha = 0.75; // Default fill — solid discs read as genuinely filled
       let targetSelected = 0.0;
       // Default color: the node's muted subject color.
       let tr = colorCache[i].r;
@@ -921,7 +921,10 @@ export default function ThreeDGraphCanvas({
       transparent: true,
       depthWrite: false,
       depthTest: true,
-      blending: THREE.AdditiveBlending,
+      // NormalBlending renders the solid opaque discs (matches the reference).
+      // AdditiveBlending was what gave the old glow; opaque fill + normal
+      // blending reads as crisp filled dots instead.
+      blending: THREE.NormalBlending,
     });
 
     pointsMaterialRef.current = pointsMaterial;
@@ -1322,10 +1325,14 @@ export default function ThreeDGraphCanvas({
       }
 
       if (closestNode) {
-        // Toggle: clicking the already-active node deselects it.
-        if (activeTopicRef.current?.id === closestNode.topic.id) {
-          onDeselectRef.current?.();
-          if (isTouch) setTouchPinnedTopic(null);
+        // Single-click selects a node, or switches to a different one.
+        // Clicking the already-active node is a no-op on desktop so the
+        // double-click handler owns deselection (a single click would otherwise
+        // steal the node before the dblclick lands). Touch keeps the legacy
+        // tap-to-toggle because dblclick is unreliable on touch surfaces.
+        const isActive = activeTopicRef.current?.id === closestNode.topic.id;
+        if (isActive && !isTouch) {
+          // no-op — double-click deselects
         } else {
           onSelectTopicRef.current(closestNode.topic);
           if (isTouch) setTouchPinnedTopic(closestNode.topic);
@@ -1346,10 +1353,40 @@ export default function ThreeDGraphCanvas({
       canvas.style.cursor = "grab";
     };
 
+    // Double-click the selected node to remove (deselect) it. Touch surfaces
+    // don't emit dblclick reliably, so touch keeps tap-to-toggle in the pointer
+    // handler above. Desktop single-click still selects/switches; this only
+    // owns the "deselect the active node" gesture.
+    const onDoubleClick = (e: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      let closestNode: typeof projectedCoordsRef.current[0] | null = null;
+      let minDistSq = TAP_RADIUS_SQ_DESKTOP;
+      let bestDepth = Infinity;
+      for (const node of projectedCoordsRef.current) {
+        const dx = x - node.sx;
+        const dy = y - node.sy;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < minDistSq && node.zDepth < bestDepth) {
+          minDistSq = distSq;
+          bestDepth = node.zDepth;
+          closestNode = node;
+        }
+      }
+
+      // Only deselect when the double-click lands on the active node.
+      if (closestNode && activeTopicRef.current?.id === closestNode.topic.id) {
+        onDeselectRef.current?.();
+      }
+    };
+
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);
     canvas.addEventListener("pointerleave", onPointerLeave);
+    canvas.addEventListener("dblclick", onDoubleClick);
     canvas.style.cursor = "grab";
 
     render();
@@ -1363,6 +1400,7 @@ export default function ThreeDGraphCanvas({
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("pointerleave", onPointerLeave);
+      canvas.removeEventListener("dblclick", onDoubleClick);
 
       controls.dispose();
 
@@ -1435,7 +1473,7 @@ export default function ThreeDGraphCanvas({
           title={autoRotate ? "Pause auto-rotate" : "Play auto-rotate"}
           aria-label={autoRotate ? "Pause auto-rotate" : "Play auto-rotate"}
           aria-pressed={autoRotate}
-          className={`pointer-events-auto flex items-center justify-center w-9 h-9 rounded-lg border backdrop-blur-md transition-[colors,transform] duration-150 ease-out active:scale-95 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#0b0e14] ${
+          className={`pointer-events-auto flex items-center justify-center w-10 h-10 rounded-lg border backdrop-blur-md transition-[colors,transform] duration-150 ease-out active:scale-95 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#0b0e14] ${
             autoRotate
               ? "bg-blue-500/15 border-blue-400/30 text-blue-200 hover:bg-blue-500/25"
               : "bg-[#0b0e14]/70 border-white/10 text-slate-300 hover:text-white hover:border-white/20"
@@ -1447,7 +1485,7 @@ export default function ThreeDGraphCanvas({
           onClick={handleResetView}
           title="Reset view"
           aria-label="Reset view"
-          className="pointer-events-auto flex items-center justify-center w-9 h-9 rounded-lg border bg-[#0b0e14]/70 border-white/10 text-slate-300 hover:text-white hover:border-white/20 backdrop-blur-md transition-[colors,transform] duration-150 ease-out active:scale-95 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#0b0e14]"
+          className="pointer-events-auto flex items-center justify-center w-10 h-10 rounded-lg border bg-[#0b0e14]/70 border-white/10 text-slate-300 hover:text-white hover:border-white/20 backdrop-blur-md transition-[colors,transform] duration-150 ease-out active:scale-95 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#0b0e14]"
         >
           <LocateFixed className="w-4 h-4" />
         </button>

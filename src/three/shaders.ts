@@ -62,24 +62,13 @@ export const POINTS_FRAGMENT_SHADER = `
       discard;
     }
 
-    // Clean, soft, anti-aliased circular dot — no fake-sphere lighting, no
-    // specular hotspot, no rim. A smooth radial falloff gives the glowing
-    // vector-dot aesthetic. Additive blending makes overlaps glow elegantly.
-    float alpha = smoothstep(1.0, 0.55, r2);
+    // Solid, opaque dot: a ~1px anti-aliased edge with a flat full-opacity
+    // interior. NormalBlending + opaque fill gives the crisp filled-disc
+    // aesthetic (matches the reference), replacing the old additive glow.
+    float alpha = smoothstep(1.0, 0.92, r2);
 
-    // Subtle bright core so the dot reads as a luminous point, not a flat disc.
-    float core = smoothstep(0.45, 0.0, r2) * 0.35;
-    vec3 col = vColor + vColor * core;
-
-    // Gentle pulse for the primary selected node so it draws the eye without
-    // a heavy halo. Disabled under prefers-reduced-motion (the selection ring
-    // + size/opacity lift still convey selection without oscillation).
-    float selPulse = 0.0;
-    if (vSelected > 0.5 && vSelected < 1.5) {
-      selPulse = (0.12 + 0.08 * sin(uTime * 2.4)) * (1.0 - uReducedMotion);
-    }
-    col += vColor * selPulse;
-
-    gl_FragColor = vec4(col, alpha * vAlpha);
+    // Flat solid fill — no glow core, no halo. Selection is conveyed by the
+    // double-ring outline + size lift, not by shader brightness.
+    gl_FragColor = vec4(vColor, alpha * vAlpha);
   }
 `;

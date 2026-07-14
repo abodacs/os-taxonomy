@@ -2,13 +2,15 @@ import { useExplorer } from "../../state/ExplorerContext";
 
 /**
  * Bottom-left overlay: the subject legend. Each subject is a toggle button
- * that shows/hides that subject's nodes in the 3D graph. State is conveyed
- * via `aria-pressed` (not just visual opacity) for assistive tech.
+ * that, when clicked, ISOLATES that subject in the 3D graph — only its nodes
+ * and the edges between them remain visible. Clicking the already-isolated
+ * subject restores all subjects. State is conveyed via `aria-pressed` (not
+ * just visual styling) for assistive tech.
  */
 export function SubjectLegend() {
   const {
-    state: { hiddenSubjects },
-    actions: { toggleSubject },
+    state: { isolatedSubject },
+    actions: { soloSubject },
     derived: { subjectStats },
   } = useExplorer();
 
@@ -19,25 +21,27 @@ export function SubjectLegend() {
           Subjects
         </span>
         <span className="text-[10px] font-mono text-slate-500">
-          {subjectStats.length}
+          {isolatedSubject ? "isolated" : `${subjectStats.length}`}
         </span>
       </div>
 
       <div className="grid grid-cols-2 gap-1.5 text-xs">
         {subjectStats.map((sub) => {
-          const isHidden = hiddenSubjects.has(sub.name);
+          const isSoloed = isolatedSubject === sub.name;
           return (
             <button
               key={sub.name}
-              onClick={() => toggleSubject(sub.name)}
-              aria-pressed={!isHidden}
+              onClick={() => soloSubject(sub.name)}
+              aria-pressed={isSoloed}
               aria-label={`${sub.name}: ${sub.count} topics. ${
-                isHidden ? "Currently hidden. Click to show." : "Currently shown. Click to hide."
+                isSoloed
+                  ? "Currently isolated. Click to show all subjects."
+                  : "Click to isolate this subject."
               }`}
               className={`flex items-center justify-between px-2 py-1.5 rounded-md border text-left transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
-                isHidden
-                  ? "bg-transparent border-white/5 opacity-40 hover:opacity-60"
-                  : "bg-white/[0.03] border-white/8 hover:border-white/15"
+                isSoloed
+                  ? "bg-white/[0.06] border-white/25"
+                  : "bg-white/[0.03] border-white/8 opacity-70 hover:opacity-100 hover:border-white/15"
               }`}
             >
               <div className="flex items-center gap-1.5 truncate">
@@ -45,9 +49,16 @@ export function SubjectLegend() {
                   className="w-2 h-2 rounded-full shrink-0"
                   style={{
                     backgroundColor: sub.color,
+                    // Dim the dot for non-isolated subjects so the isolated
+                    // one reads as the active selection against a quiet field.
+                    opacity: isSoloed ? 1 : 0.5,
                   }}
                 />
-                <span className="truncate font-medium text-[11px] text-slate-300">
+                <span
+                  className={`truncate font-medium text-[11px] ${
+                    isSoloed ? "text-slate-100" : "text-slate-300"
+                  }`}
+                >
                   {sub.name}
                 </span>
               </div>

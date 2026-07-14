@@ -66,7 +66,7 @@ function Explorer() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 relative">
         <main
           id="main-content"
-          className="lg:col-span-8 h-[60vh] lg:h-screen relative flex flex-col justify-between p-4 md:p-6 border-b lg:border-b-0 lg:border-r border-white/5"
+          className="lg:col-span-8 h-[58vh] lg:h-screen relative flex flex-col justify-between p-4 md:p-6 border-b lg:border-b-0 lg:border-r border-white/5"
         >
           {/* Top-Left Overlay Panel */}
           <BrandOverlay />

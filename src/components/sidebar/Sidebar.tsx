@@ -35,7 +35,7 @@ const TAB_META: Record<
 function SidebarShell({ children }: { children: ReactNode }) {
   return (
     <aside
-      className="lg:col-span-4 p-4 md:p-6 flex flex-col h-[calc(100vh-60vh)] lg:h-screen overflow-hidden bg-[#050914]/90 backdrop-blur-xl border-t lg:border-t-0 border-white/5"
+      className="lg:col-span-4 p-4 md:p-6 flex flex-col min-h-[42vh] lg:h-screen overflow-hidden bg-[#050914]/90 backdrop-blur-xl border-t lg:border-t-0 border-white/5"
       aria-label="Explorer details"
     >
       {children}

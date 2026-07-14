@@ -7,7 +7,7 @@ export function NavHint() {
   return (
     <div
       aria-hidden="true"
-      className="text-[10px] text-slate-500 font-mono tracking-wide bg-[#0b0e14]/60 px-3 py-1.5 rounded-full border border-white/5 self-start md:self-auto backdrop-blur-xs"
+      className="hidden sm:block text-[10px] text-slate-500 font-mono tracking-wide bg-[#0b0e14]/60 px-3 py-1.5 rounded-full border border-white/5 self-start md:self-auto backdrop-blur-xs"
     >
       Drag to orbit · Scroll to zoom · Click a node to inspect
     </div>
