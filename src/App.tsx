@@ -42,14 +42,15 @@ function Explorer() {
   } = useExplorer();
 
   return (
-    <div className="min-h-screen bg-[#03060f] text-slate-100 flex flex-col font-sans relative overflow-hidden">
-      {/* Background ambient radial glowing spots for visual luxury */}
+    <div className="min-h-screen bg-[#0b0e14] text-slate-100 flex flex-col font-sans relative overflow-hidden">
+      {/* Background ambient radial spots — heavily dimmed to keep the
+          near-black vector-network aesthetic clean. */}
       <div
-        className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full bg-indigo-900/10 blur-[150px] pointer-events-none"
+        className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full bg-blue-950/8 blur-[180px] pointer-events-none"
         aria-hidden="true"
       />
       <div
-        className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-emerald-900/10 blur-[150px] pointer-events-none"
+        className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-rose-950/6 blur-[180px] pointer-events-none"
         aria-hidden="true"
       />
 

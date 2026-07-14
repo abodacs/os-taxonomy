@@ -70,6 +70,13 @@ export function getTransitivePrerequisites(id: string): { topic: Topic; distance
   return traverseTransitive(id, prereqAdjacencyList, dep => dep.prerequisiteId);
 }
 
+// Helper: Compute transitive sequels (everything this topic unlocks)
+// Returns list of unique topic IDs that depend on the start topic, directly
+// or transitively, with their graph distance from the start node.
+export function getTransitiveSequels(id: string): { topic: Topic; distance: number }[] {
+  return traverseTransitive(id, unlockAdjacencyList, dep => dep.topicId);
+}
+
 // Helper: Get cluster summary for a topic
 export function getClusterSummary(subject: string, domain: string, age: number): Cluster | undefined {
   // Find a cluster with matching subject and domain where ageRangeStart <= age
