@@ -8,7 +8,6 @@ import {
 import { Topic } from "../types";
 import {
   topicsList,
-  topicsMap,
   curriculaList,
 } from "../dataLoader";
 import { SUBJECT_COLORS, subjectColor as subjectColorUtil } from "../theme/subjectColors";
@@ -28,8 +27,15 @@ export type HudTab = "inspect" | "search" | "standards" | "pathways";
 export interface ExplorerState {
   /** Selected concept for the inspector / 3D highlight. */
   activeTopic: Topic | null;
-  /** Subjects hidden from the 3D graph via the legend toggles. */
+  /**
+   * Subjects hidden from the 3D graph. Derived from `isolatedSubject` — when
+   * a subject is soloed, every other subject is hidden so only that subject's
+   * nodes (and the edges between them) remain. `null` → all subjects shown.
+   * Kept as a field so the 3D canvas contract is unchanged.
+   */
   hiddenSubjects: Set<string>;
+  /** The subject currently isolated in the 3D graph, or null to show all. */
+  isolatedSubject: string | null;
   /** Active sidebar tab. */
   activeHudTab: HudTab;
   /** Auto-rotate toggle for the 3D graph. */
@@ -51,7 +57,8 @@ export interface ExplorerState {
 export interface ExplorerActions {
   selectTopic: (topic: Topic) => void;
   deselectTopic: () => void;
-  toggleSubject: (subject: string) => void;
+  /** Solo a subject (isolate its nodes + internal edges) or restore all. */
+  soloSubject: (subject: string) => void;
   setHudTab: (tab: HudTab) => void;
   toggleAutoRotate: () => void;
   resetView: () => void;
@@ -101,20 +108,14 @@ type Standard = Curriculum["topics"][number];
 
 const ExplorerContext = createContext<ExplorerContextValue | null>(null);
 
-const DEFAULT_TOPIC_ID = "mt_N8CpN1EJrP"; // "Building sentences"
-
 export function ExplorerProvider({ children }: { children: ReactNode }) {
-  const defaultTopic = useMemo(
-    () => topicsMap.get(DEFAULT_TOPIC_ID) || topicsList[0],
-    []
-  );
-
-  const [activeTopic, setActiveTopic] = useState<Topic | null>(
-    defaultTopic || null
-  );
-  const [hiddenSubjects, setHiddenSubjects] = useState<Set<string>>(
-    new Set()
-  );
+  // Start on the complete taxonomy. A topic becomes active only after an
+  // explicit click, tap, or selection from the catalog/sidebar.
+  const [activeTopic, setActiveTopic] = useState<Topic | null>(null);
+  // The subject currently isolated in the graph (or null = all subjects shown).
+  // `hiddenSubjects` is derived from this in the value memo below so the 3D
+  // canvas contract (which consumes `hiddenSubjects`) stays unchanged.
+  const [isolatedSubject, setIsolatedSubject] = useState<string | null>(null);
   const [activeHudTab, setActiveHudTab] = useState<HudTab>("inspect");
   const [autoRotate, setAutoRotate] = useState(false);
 
@@ -149,13 +150,14 @@ export function ExplorerProvider({ children }: { children: ReactNode }) {
 
   const deselectTopic = () => setActiveTopic(null);
 
-  const toggleSubject = (subject: string) => {
-    setHiddenSubjects((prev) => {
-      const next = new Set(prev);
-      if (next.has(subject)) next.delete(subject);
-      else next.add(subject);
-      return next;
-    });
+  // Solo: clicking a subject isolates it (every other subject becomes hidden);
+  // clicking the already-soloed subject again restores all subjects. Clicking a
+  // different subject switches the solo. This is what "click show nodes and
+  // related edges only" means — once isolated, the 3D canvas naturally shows
+  // only that subject's nodes and the edges between them (its edge filter keeps
+  // an edge only when both endpoints are visible).
+  const soloSubject = (subject: string) => {
+    setIsolatedSubject((prev) => (prev === subject ? null : subject));
   };
 
   const setHudTab = (tab: HudTab) => setActiveHudTab(tab);
@@ -175,6 +177,15 @@ export function ExplorerProvider({ children }: { children: ReactNode }) {
   };
 
   // --- Derived data --------------------------------------------------------
+  // The effective hidden-subjects set the 3D canvas consumes. When a subject is
+  // isolated, every other subject is hidden; otherwise nothing is hidden.
+  const hiddenSubjects = useMemo(() => {
+    if (!isolatedSubject) return new Set<string>();
+    return new Set(
+      Object.keys(SUBJECT_COLORS).filter((s) => s !== isolatedSubject)
+    );
+  }, [isolatedSubject]);
+
   const subjectStats = useMemo(() => {
     const stats: Record<string, number> = {};
     for (const t of topicsList) {
@@ -235,6 +246,7 @@ export function ExplorerProvider({ children }: { children: ReactNode }) {
       state: {
         activeTopic,
         hiddenSubjects,
+        isolatedSubject,
         activeHudTab,
         autoRotate,
         catalogSearchTerm,
@@ -249,7 +261,7 @@ export function ExplorerProvider({ children }: { children: ReactNode }) {
       actions: {
         selectTopic,
         deselectTopic,
-        toggleSubject,
+        soloSubject,
         setHudTab,
         toggleAutoRotate,
         resetView,
@@ -276,6 +288,7 @@ export function ExplorerProvider({ children }: { children: ReactNode }) {
     }),
     [
       activeTopic,
+      isolatedSubject,
       hiddenSubjects,
       activeHudTab,
       autoRotate,

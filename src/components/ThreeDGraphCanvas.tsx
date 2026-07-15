@@ -1,16 +1,23 @@
 import { useEffect, useRef, useState, useMemo } from "react";
 import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import { Play, Pause, LocateFixed } from "lucide-react";
 import { Topic } from "../types";
-import { topicsList, dependenciesList, getTransitivePrerequisites } from "../dataLoader";
-import { SUBJECT_COLORS, subjectColor } from "../theme/subjectColors";
+import {
+  topicsList,
+  dependenciesList,
+  getTransitivePrerequisites,
+  prereqAdjacencyList,
+} from "../dataLoader";
+import { SUBJECT_COLORS, subjectColor, STATE_COLORS } from "../theme/subjectColors";
 import {
   POINTS_VERTEX_SHADER,
   POINTS_FRAGMENT_SHADER,
-  PARTICLE_VERTEX_SHADER,
-  PARTICLE_FRAGMENT_SHADER,
 } from "../three/shaders";
-import { getLightningOffset } from "../three/graphLayout";
+import { funnelRadius, funnelYForAge } from "../three/graphLayout";
 
 interface ThreeDGraphCanvasProps {
   activeTopic: Topic | null;
@@ -22,18 +29,55 @@ interface ThreeDGraphCanvasProps {
   onResetView: () => void;
 }
 
-// Minimal HTML escaper for label text (topic names come from trusted JSON,
-// but we never want a stray character to break the label DOM).
-const escapeHtml = (s: string) =>
-  s.replace(/[&<>"']/g, (c) =>
-    c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;");
-
 // How long the cursor must rest on a node before the hover card appears.
-// Long enough to suppress strobing when sweeping a dense cluster, short
-// enough to feel instant on a deliberate stop.
 const HOVER_DWELL_MS = 120;
 // Gap between the anchor node and the hover card, in CSS pixels.
 const TOOLTIP_GAP_PX = 14;
+// Per-frame scale applied to the hover-card reveal — origin-aware, so the
+// card grows out of the node it describes rather than from its own center.
+const TOOLTIP_REVEAL_SCALE = 0.96;
+
+// --- Camera / interaction constants (OrbitControls) ---
+const DEFAULT_CAMERA_DISTANCE = 320;
+const FRAMING_CAMERA_DISTANCE = 310;
+const DEFAULT_CAMERA_POSITION = { x: 168, y: 57, z: 266 };
+const CLICK_THRESHOLD_SQ = 36; // 6px displacement squared
+const TAP_RADIUS_SQ_DESKTOP = 256; // 16px hover/click radius squared
+const TAP_RADIUS_SQ_TOUCH = 1600; // 40px touch tap radius squared
+const TAP_MAX_DURATION_MS = 350;
+
+// Reduced-motion: once the user has seen one tooltip, subsequent hovers on
+// adjacent nodes skip the dwell so the whole canvas feels instant. Reset on
+// pointer leave so re-entering starts fresh.
+
+/**
+ * Frame-rate-independent exponential damping. Converts a "smoothing factor"
+ * designed for 60fps (the old per-frame `+= (t-x)*k` lerps) into a lerp whose
+ * effective duration is the same wall-clock time at any frame rate.
+ *
+ *   damp(cur, target, k60, dt)
+ *
+ * where k60 is the legacy 60fps factor (e.g. 0.08 → ~370ms to half) and dt is
+ * the seconds elapsed since the last frame. At 60fps this is identical to the
+ * old `cur += (target-cur)*k60`; at 120fps it advances half as far per frame,
+ * so the animation takes the same real time and doesn't feel ~2× faster.
+ */
+function damp(current: number, target: number, k60: number, dt: number): number {
+  return current + (target - current) * (1 - Math.pow(1 - k60, dt * 60));
+}
+
+// prefers-reduced-motion: checked once at setup. Auto-rotate and the two
+// oscillating pulses (selection ring + shader selPulse) are gated on this;
+// size/opacity transitions are kept because they aid comprehension, which is
+// the reduced-motion best practice (fewer/gentler, not zero).
+const prefersReducedMotion =
+  typeof window !== "undefined" &&
+  window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+// State colors as plain RGB float triples for fast per-node lerp.
+const RGB_PRIMARY = new THREE.Color(STATE_COLORS.primary);
+const RGB_BRANCH = new THREE.Color(STATE_COLORS.branch);
+const RGB_TERMINAL = new THREE.Color(STATE_COLORS.terminal);
 
 // Pure placement decision for the tooltip card: prefer above the anchor node,
 // flip below if it would clip the top edge and there's room beneath, and clamp
@@ -69,62 +113,42 @@ export default function ThreeDGraphCanvas({
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Labels refs for absolute positioned HTML HUD elements
-  const labelBottomRef = useRef<HTMLDivElement>(null);
-  const labelMiddleRef = useRef<HTMLDivElement>(null);
-  const labelTopRef = useRef<HTMLDivElement>(null);
-
   // Floating tooltip ref
   const tooltipRef = useRef<HTMLDivElement>(null);
   // Sub-elements of the hover card, written imperatively each frame.
-  const tooltipBarRef = useRef<HTMLSpanElement>(null);
-  const tooltipDomainRef = useRef<HTMLSpanElement>(null);
-  const tooltipAgeRef = useRef<HTMLSpanElement>(null);
+  const tooltipDotRef = useRef<HTMLSpanElement>(null);
+  const tooltipMetaRef = useRef<HTMLSpanElement>(null);
   const tooltipTitleRef = useRef<HTMLDivElement>(null);
   const tooltipDescRef = useRef<HTMLDivElement>(null);
 
-  // Smart node-label layer. A pre-allocated pool of label divs is repositioned
-  // each frame from the existing screen-space projection. Pool sizing avoids
-  // React re-renders at 60fps while keeping label placement GPU-synchronized.
-  const LABEL_POOL_SIZE = 64;
-  const labelLayerRef = useRef<HTMLDivElement>(null);
-  const labelPoolRef = useRef<Array<HTMLDivElement>>([]);
+  // OrbitControls + interaction refs
+  const controlsRef = useRef<OrbitControls | null>(null);
+  const pointerActiveRef = useRef(false);
+  const onSelectTopicRef = useRef(onSelectTopic);
+  const framingAnimRef = useRef<{
+    active: boolean;
+    targetPos: THREE.Vector3;
+    targetCamPos: THREE.Vector3;
+    targetDist: number;
+  }>({ active: false, targetPos: new THREE.Vector3(0, 0, 0), targetCamPos: new THREE.Vector3(DEFAULT_CAMERA_POSITION.x, DEFAULT_CAMERA_POSITION.y, DEFAULT_CAMERA_POSITION.z), targetDist: DEFAULT_CAMERA_DISTANCE });
 
-  // Interaction refs
-  const rotation = useRef({ x: -0.3, y: 0.6 });
-  const targetRotation = useRef({ x: -0.3, y: 0.6 });
-  const zoom = useRef(1.85);
-  const targetZoom = useRef(1.85);
-  const pan = useRef({ x: 0, y: 0 });
-  const targetPan = useRef({ x: 0, y: 0 });
-
-  const isDragging = useRef(false);
-  const dragStart = useRef({ x: 0, y: 0 });
   const lastInteractionTime = useRef(Date.now());
-  // Tracks cumulative pointer movement during a press so we can distinguish a
-  // click (small movement) from an orbit/pan drag (large movement). Without
-  // this, finishing a drag selects whatever node is under the cursor.
-  const pressMovedDistSq = useRef(0);
-  const pressActive = useRef(false);
-
-  // Mobile / Touch interaction helper refs
-  const touchStartTimeRef = useRef<number>(0);
-  const touchStartPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-  const pinchStartDistRef = useRef<number>(0);
-  const zoomStartValRef = useRef<number>(1.85);
 
   // Hover-intent dwell: record the candidate node + the timestamp it first
   // became a candidate, and only commit the hover after a short dwell. This
   // kills the text-strobe when sweeping a dense cluster without adding
   // perceptible latency on a real stop.
   const hoverDwellRef = useRef<{ id: string | null; since: number }>({ id: null, since: 0 });
+  // Once a tooltip has shown this session, subsequent hovers on adjacent nodes
+  // skip the dwell delay so the toolbar/canvas feels instant. Reset on
+  // pointerleave so re-entering starts the first dwell again.
+  const tooltipOpenedRef = useRef(false);
 
   // Hover state
   const [hoveredTopic, setHoveredTopic] = useState<Topic | null>(null);
+  const [sceneReady, setSceneReady] = useState(false);
   // Touch-pinned topic: the node a mobile tap selected. Unlike hover, this
-  // persists until the next pan, empty-tap, or deselect (see handleTouch* and
-  // the effect below) — replacing the old fixed 1500ms flash. The render loop
-  // shows it via the tooltip card whenever there is no mouse hover.
+  // persists until the next pan, empty-tap, or deselect.
   const [touchPinnedTopic, setTouchPinnedTopic] = useState<Topic | null>(null);
 
   // Calculate connection counts for centrality
@@ -155,54 +179,67 @@ export default function ThreeDGraphCanvas({
     return map;
   }, []);
 
-  // Pre-generate stable 3D coordinates for all 1,590 nodes forming a flaring trumpet funnel
+  // Pre-generate stable 3D coordinates for all nodes forming a tapered funnel.
+  // Vertical (Y) = age progression; radial (X & Z) = power-law funnel so the
+  // structure is narrow at the foundation (age 4) and flares toward the
+  // specialization canopy (age 15+). Subject arms + spiral twist + domain
+  // sub-sectors distribute nodes angularly around the central Y-axis.
   const nodes = useMemo(() => {
     return topicsList.map((topic, index) => {
       const age = topic.ageRangeStart || 4;
-      
-      // Vertical Y axis maps directly to age: bottom is age 4 (-120), top is age 15 (+120)
-      const normalizedY = ((age - 4) / 11 - 0.5) * 240;
 
-      // Double helix / spiraling columns: different subjects occupy distinct arms wrapping around
+      // Vertical Y axis maps directly to age: foundation at the bottom and
+      // the highest source age band at the specialization canopy.
+      const normalizedY = funnelYForAge(age);
+
+      // Subjects occupy distinct angular arms wrapping around the central axis
       const subjectsKeys = Object.keys(SUBJECT_COLORS);
       const subIdx = subjectsKeys.indexOf(topic.subject);
       const armAngle = subIdx !== -1 ? (subIdx / subjectsKeys.length) * Math.PI * 2 : 0;
-      
-      // Funnel twist: twist spiral as it goes up
+
+      // Funnel twist: spiral as it goes up
       const spiralTurn = (age - 4) * 0.42;
 
-      // Group domains into distinct tight angular sub-clusters/sectors within the subject's arm
+      // Group domains into angular sub-sectors within the subject's arm.
+      // The extra deterministic sector spread is important: without it, the
+      // nine discrete source age bands become eight thin horizontal rings.
       const domainsListForSub = subjectDomains[topic.subject] || [];
       const domIdx = domainsListForSub.indexOf(topic.domain);
       const domAngleOffset = domainsListForSub.length > 1
         ? ((domIdx / (domainsListForSub.length - 1)) - 0.5) * 0.95
         : 0;
 
-      const baseTheta = armAngle + spiralTurn + domAngleOffset;
+      // Stable hash values distribute a subject/domain arm without turning
+      // the graph into a uniform circle or introducing render-time randomness.
+      const sectorJitter = Math.sin(index * 12.9898 + 78.233);
+      const radialJitter = Math.cos(index * 4.14159 + 9.17);
+      const ageT = Math.max(0, Math.min(1, (age - 4) / 9));
+      const sectorWidth = 0.18 + ageT * 0.52;
+      const baseTheta = armAngle + spiralTurn + domAngleOffset + sectorJitter * sectorWidth;
 
-      // Trumpet-like flared radius: extremely narrow at age 4, expanding exponentially upwards
-      const r = 10 + Math.pow(age - 4, 1.45) * 5.2;
+      // Tapered funnel radius via a smooth power law.
+      const r = funnelRadius(normalizedY);
 
-      // Tight clustering: reduce dispersion to make domain clusters look highly unified
-      const dispersion = Math.max(0.7, (age - 4) * 1.35);
-      const hashX = Math.sin(index * 17.5) * dispersion;
-      // Slight vertical noise to maintain clean sequential horizontal tiers
-      const hashY = Math.cos(index * 29.2) * (dispersion * 0.22);
-      const hashZ = Math.sin(index * 41.9) * dispersion;
+      // Spread points through the volume, not just along the surface. The
+      // vertical jitter breaks up the source's discrete age bands while still
+      // preserving age as the dominant Y-axis signal.
+      const radialScale = 1 + radialJitter * (0.08 + ageT * 0.16);
+      const heightJitter = 2.5 + ageT * 5.5;
+      const hashY = Math.sin(index * 29.2 + 0.7) * heightJitter;
+      const hashX = Math.sin(index * 17.5) * (1.2 + ageT * 3.5);
+      const hashZ = Math.sin(index * 41.9) * (1.2 + ageT * 3.5);
 
-      // Fetch stable jagged lightning/thunder bolt core offset at this height
-      const thunder = getLightningOffset(normalizedY);
-
-      // Node centrality: scale node diameter dynamically based on connection density (larger and extremely punchy)
+      // Node sizing: centrality-scaled, but kept small/subtle for the
+      // minimalist dot aesthetic (inactive nodes must read as tiny points).
       const connectionCount = nodeCentrality.get(topic.id) || 0;
-      const baseRadius = 3.6 + Math.pow(connectionCount, 0.7) * 2.4;
+      const baseRadius = 2.1 + Math.pow(connectionCount, 0.6) * 1.35;
       const isMilestone = connectionCount >= 8;
 
       return {
         topic,
-        x: r * Math.cos(baseTheta) + thunder.x + hashX,
+        x: r * radialScale * Math.cos(baseTheta) + hashX,
         y: normalizedY + hashY,
-        z: r * Math.sin(baseTheta) + thunder.z + hashZ,
+        z: r * radialScale * Math.sin(baseTheta) + hashZ,
         color: subjectColor(topic.subject),
         baseRadius,
         isMilestone,
@@ -222,70 +259,74 @@ export default function ThreeDGraphCanvas({
     return map;
   }, [nodes, hiddenSubjects]);
 
-  // Transitive prerequisite IDs when a node is selected
-  const selectedPrereqIds = useMemo(() => {
-    if (!activeTopic) return new Set<string>();
-    const list = getTransitivePrerequisites(activeTopic.id);
-    const set = new Set<string>(list.map(p => p.topic.id));
-    set.add(activeTopic.id); // include itself
-    return set;
+  // Selected prerequisite sub-DAG, with role classification for the diverging
+  // color story (white = primary focus, blue = active branch, rose = deepest
+  // terminal branches). Successors stay visible as dim context but are not
+  // highlighted when a topic is selected.
+  const selectionGraph = useMemo(() => {
+    if (!activeTopic) {
+      return {
+        relatedIds: new Set<string>(),
+        prereqIds: new Set<string>(),
+        sequelIds: new Set<string>(),
+        terminalIds: new Set<string>(),
+      };
+    }
+    const prereqs = getTransitivePrerequisites(activeTopic.id);
+    const prereqIds = new Set(prereqs.map(p => p.topic.id));
+    prereqIds.add(activeTopic.id);
+    const relatedIds = new Set(prereqIds);
+
+    // Terminal leaves: prereq nodes with no prerequisites of their own, and
+    // sequel nodes that unlock nothing further. These are the "deepest
+    // terminal branches" rendered in muted rose.
+    const terminalIds = new Set<string>();
+    for (const id of prereqIds) {
+      if (id === activeTopic.id) continue;
+      const deps = prereqAdjacencyList.get(id);
+      if (!deps || deps.length === 0) terminalIds.add(id);
+    }
+    return { relatedIds, prereqIds, sequelIds: new Set<string>(), terminalIds };
   }, [activeTopic]);
 
-  // Smart labels: which node ids should display a persistent HTML label.
-  // Milestones (high-connectivity), the selected node, its prerequisite path,
-  // and the currently hovered node. Keeps clutter low while making the graph
-  // readable at a glance and the active path legible as a labeled trail.
-  const labeledNodeIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const node of nodes) {
-      if (node.isMilestone && !hiddenSubjects.has(node.topic.subject)) {
-        ids.add(node.topic.id);
-      }
-    }
-    if (activeTopic) {
-      for (const id of selectedPrereqIds) ids.add(id);
-    }
-    if (hoveredTopic) ids.add(hoveredTopic.id);
-    return ids;
-  }, [nodes, hiddenSubjects, activeTopic, selectedPrereqIds, hoveredTopic]);
-
-  // Fast id -> node lookup for label rendering in the render loop.
+  // Fast id -> node lookup for selection ring tracking in the render loop.
   const nodeByTopicId = useMemo(() => {
     const map = new Map<string, typeof nodes[0]>();
     for (const node of nodes) map.set(node.topic.id, node);
     return map;
   }, [nodes]);
 
-  // Screen space projected coordinates ref, updated on every frame
-  const projectedCoordsRef = useRef<Array<{
-    topic: Topic;
-    sx: number;
-    sy: number;
-    zDepth: number;
-    color: string;
-    baseRadius: number;
-    isMilestone: boolean;
-  }>>([]);
+  // Screen-space projection cache. The objects are created once per stable
+  // layout and mutated in place every frame; hover and tap never allocate a
+  // filtered/map array for all 1,590 nodes.
+  const projectedCoords = useMemo(() => nodes.map(node => ({
+    topic: node.topic,
+    sx: 0,
+    sy: 0,
+    zDepth: 0,
+    color: node.color,
+    baseRadius: node.baseRadius,
+    isMilestone: node.isMilestone,
+    visible: true,
+  })), [nodes]);
+  const projectedCoordsRef = useRef(projectedCoords);
 
   // WebGL stable object references for updates and cleanups
   const pointsGeometryRef = useRef<THREE.BufferGeometry | null>(null);
   const pointsMaterialRef = useRef<THREE.ShaderMaterial | null>(null);
-  const particleMaterialRef = useRef<THREE.ShaderMaterial | null>(null);
   const hardEdgesGeometryRef = useRef<THREE.BufferGeometry | null>(null);
   const softEdgesGeometryRef = useRef<THREE.BufferGeometry | null>(null);
   const backgroundSoftLinesRef = useRef<THREE.LineSegments | null>(null);
-  const activeHardGeometryRef = useRef<THREE.BufferGeometry | null>(null);
-  const activeSoftGeometryRef = useRef<THREE.BufferGeometry | null>(null);
-  const activeSoftLinesRef = useRef<THREE.LineSegments | null>(null);
-  const activeHardMaterialRef = useRef<THREE.LineBasicMaterial | null>(null);
-  const activeSoftMaterialRef = useRef<THREE.LineDashedMaterial | null>(null);
+  const activeHardGeometryRef = useRef<LineSegmentsGeometry | null>(null);
+  const activeSoftGeometryRef = useRef<LineSegmentsGeometry | null>(null);
+  const activeSoftLinesRef = useRef<LineSegments2 | null>(null);
+  const activeHardMaterialRef = useRef<LineMaterial | null>(null);
+  const activeSoftMaterialRef = useRef<LineMaterial | null>(null);
   const hardEdgesMaterialRef = useRef<THREE.LineBasicMaterial | null>(null);
   const softEdgesMaterialRef = useRef<THREE.LineDashedMaterial | null>(null);
   const activeEdgesRef = useRef<Array<{
     from: { x: number; y: number; z: number };
     to: { x: number; y: number; z: number };
-    // Quadratic-bezier control point: the edge bows outward from the funnel
-    // center along the radial direction so overlapping path edges separate.
     mid: { x: number; y: number; z: number };
     color: THREE.Color;
     subject: string;
@@ -296,11 +337,11 @@ export default function ThreeDGraphCanvas({
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const graphGroupRef = useRef<THREE.Group | null>(null);
-  // Selection halo: a billboarded ring that tracks the selected node's world
-  // position each frame. Parented to the scene (not graphGroup) so it doesn't
-  // inherit graph rotation; we reposition it imperatively.
-  const selectionHaloRef = useRef<THREE.Mesh | null>(null);
-  const selectionHaloOpacityRef = useRef(0);
+  // Single selection outline tracking the selected node's world position.
+  // Parented to the scene (not graphGroup) so it stays billboarded while the
+  // camera orbits the taxonomy.
+  const selectionRingInnerRef = useRef<THREE.LineLoop | null>(null);
+  const selectionRingOpacityRef = useRef(0);
 
   // Mouse hover tracking (vsync-throttled hover)
   const mousePosRef = useRef<{ x: number; y: number } | null>(null);
@@ -309,22 +350,22 @@ export default function ThreeDGraphCanvas({
   const animatedSizesRef = useRef<Float32Array | null>(null);
   const animatedAlphasRef = useRef<Float32Array | null>(null);
   const animatedSelectedRef = useRef<Float32Array | null>(null);
+  const animatedColorsRef = useRef<Float32Array | null>(null);
 
   // Sync reactive properties into refs for render loop access without re-instantiation
   const activeTopicRef = useRef(activeTopic);
   const hoveredTopicRef = useRef(hoveredTopic);
   const touchPinnedTopicRef = useRef(touchPinnedTopic);
-  // Cached measured card size, re-measured when the shown topic changes
-  // (content drives height) and cleared on hide. Used for viewport collision
-  // handling (flip/clamp) in the render loop.
   const tooltipDimsRef = useRef<{ id: string; w: number; h: number } | null>(null);
+  // Animated reveal scale for the hover card. Decays toward 1 (fully open)
+  // over a few frames whenever a card is showing; resets to the reveal start
+  // when the card hides so the next reveal grows out of its node again.
+  const tooltipScaleRef = useRef(1);
   const hiddenSubjectsRef = useRef(hiddenSubjects);
   const nodesRef = useRef(nodes);
-  const selectedPrereqIdsRef = useRef(selectedPrereqIds);
+  const selectionGraphRef = useRef(selectionGraph);
   const autoRotateRef = useRef(autoRotate);
   const onDeselectRef = useRef(onDeselectTopic);
-  const labeledNodeIdsRef = useRef<Set<string>>(new Set());
-  // Fast id -> node lookup, rebuilt whenever nodes change, for label rendering.
   const nodeByTopicIdRef = useRef<Map<string, typeof nodes[0]>>(new Map());
 
   useEffect(() => {
@@ -333,57 +374,71 @@ export default function ThreeDGraphCanvas({
     touchPinnedTopicRef.current = touchPinnedTopic;
     hiddenSubjectsRef.current = hiddenSubjects;
     nodesRef.current = nodes;
-    selectedPrereqIdsRef.current = selectedPrereqIds;
+    selectionGraphRef.current = selectionGraph;
     autoRotateRef.current = autoRotate;
     onDeselectRef.current = onDeselectTopic;
-    labeledNodeIdsRef.current = labeledNodeIds;
     nodeByTopicIdRef.current = nodeByTopicId;
-  }, [activeTopic, hoveredTopic, touchPinnedTopic, hiddenSubjects, nodes, selectedPrereqIds, autoRotate, onDeselectTopic, labeledNodeIds, nodeByTopicId]);
+    projectedCoordsRef.current = projectedCoords;
+    onSelectTopicRef.current = onSelectTopic;
+  }, [activeTopic, hoveredTopic, touchPinnedTopic, hiddenSubjects, nodes, selectionGraph, autoRotate, onDeselectTopic, nodeByTopicId, onSelectTopic, projectedCoords]);
 
   // Clear the touch-pinned card whenever the selection is cleared by any path
-  // (e.g. the sidebar's close button). A no-op when a new selection arrives,
-  // since activeTopic is then truthy. Keeps the pinned preview in sync with
-  // what is actually selected.
   useEffect(() => {
     if (activeTopic === null) setTouchPinnedTopic(null);
   }, [activeTopic]);
 
-  // High-performance CPU update for size/alpha attributes, transitioning values smoothly
-  const updateNodeAttributes = (forceImmediate = false) => {
+  // Precompute per-node subject colors as THREE.Color for the color lerp.
+  const colorCache = useMemo(() => nodes.map(node => new THREE.Color(node.color)), [nodes]);
+
+  // High-performance CPU update for size/alpha/color/selected attributes,
+  // transitioning values smoothly. Colors lerp between the subject color
+  // (default) and the state-based diverging palette (on selection).
+  // `dt` is seconds since the last frame for frame-rate-independent damping;
+  // when omitted (e.g. the one-shot useEffect kick on state change) a single
+  // 60fps step is used, which is plenty for a kick.
+  const updateNodeAttributes = (forceImmediate = false, dt?: number) => {
     const geometry = pointsGeometryRef.current;
     if (!geometry) return;
 
     const sizes = geometry.attributes.aSize.array as Float32Array;
     const alphas = geometry.attributes.aAlpha.array as Float32Array;
     const selectedAttr = geometry.attributes.aSelected.array as Float32Array;
+    const colorAttr = geometry.attributes.aColor.array as Float32Array;
 
     const currentActiveTopic = activeTopicRef.current;
     const currentHiddenSubjects = hiddenSubjectsRef.current;
     const currentHoveredTopic = hoveredTopicRef.current;
-    const currentSelectedPrereqIds = selectedPrereqIdsRef.current;
+    const currentSelection = selectionGraphRef.current;
     const currentNodes = nodesRef.current;
 
     const isTopicSelected = !!currentActiveTopic;
 
-    // Initialize animated arrays if not present or size mismatch
     if (!animatedSizesRef.current || animatedSizesRef.current.length !== currentNodes.length) {
       animatedSizesRef.current = new Float32Array(currentNodes.length);
       animatedAlphasRef.current = new Float32Array(currentNodes.length);
       animatedSelectedRef.current = new Float32Array(currentNodes.length);
+      animatedColorsRef.current = new Float32Array(currentNodes.length * 3);
       forceImmediate = true;
     }
 
     const animatedSizes = animatedSizesRef.current;
     const animatedAlphas = animatedAlphasRef.current;
     const animatedSelected = animatedSelectedRef.current;
-    if (!animatedSizes || !animatedAlphas || !animatedSelected) return;
+    const animatedColors = animatedColorsRef.current;
+    if (!animatedSizes || !animatedAlphas || !animatedSelected || !animatedColors) return;
+
+    const selId = currentActiveTopic?.id;
 
     currentNodes.forEach((node, i) => {
       const isHidden = currentHiddenSubjects.has(node.topic.subject);
 
-      let targetSize = node.baseRadius * 1.4;
-      let targetAlpha = 1.0; // Baseline opacity (fully opaque)
-      let targetSelected = 0.0; // Default
+      let targetSize = node.baseRadius * 1.0;
+      let targetAlpha = 0.9; // Reference uses readable solid subject dots
+      let targetSelected = 0.0;
+      // Default color: the node's muted subject color.
+      let tr = colorCache[i].r;
+      let tg = colorCache[i].g;
+      let tb = colorCache[i].b;
 
       if (isHidden) {
         targetSize = 0.0;
@@ -391,33 +446,48 @@ export default function ThreeDGraphCanvas({
         targetSelected = 0.0;
       } else {
         if (isTopicSelected) {
-          const isSelected = currentActiveTopic && node.topic.id === currentActiveTopic.id;
-          const isPartOfPath = currentSelectedPrereqIds.has(node.topic.id);
+          const isSelected = selId === node.topic.id;
+          const isTerminal = currentSelection.terminalIds.has(node.topic.id);
+          const isRelated = currentSelection.relatedIds.has(node.topic.id);
 
           if (isSelected) {
-            // Selected node: a clear but not oversized bump (was 2.3x which was
-            // far too large — it swallowed neighbours). The selection halo
-            // carries the emphasis, so the node itself just needs to read.
             targetSize = node.baseRadius * 1.7;
             targetAlpha = 1.0;
-            targetSelected = 1.0; // Selected node
-          } else if (isPartOfPath) {
-            // Prerequisite-path node: keep full subject color (alpha ~1.0) so
-            // the connected trail stays vivid instead of washing out.
+            targetSelected = 1.0;
+            tr = RGB_PRIMARY.r; tg = RGB_PRIMARY.g; tb = RGB_PRIMARY.b;
+          } else if (isTerminal) {
+            targetSize = node.baseRadius * 1.25;
+            targetAlpha = 1.0;
+            targetSelected = 5.0;
+            tr = RGB_TERMINAL.r; tg = RGB_TERMINAL.g; tb = RGB_TERMINAL.b;
+          } else if (isRelated) {
             targetSize = node.baseRadius * 1.2;
             targetAlpha = 1.0;
-            targetSelected = 2.0; // Prerequisite path node
+            targetSelected = 2.0;
+            tr = RGB_BRANCH.r; tg = RGB_BRANCH.g; tb = RGB_BRANCH.b;
           } else {
-            targetSize = node.baseRadius * 1.0;
-            targetAlpha = 0.4; // Dimmed background (was 0.25 — too aggressive)
-            targetSelected = 3.0; // Dimmed background node
+            // Unrelated: near-invisible per spec §7. The selected sub-DAG
+            // (primary white / branch blue / terminal rose, all at full
+            // opacity) pops against a near-empty field; the faint residual
+            // keeps just enough of the surrounding web for spatial reference.
+            targetSize = node.baseRadius * 0.82;
+            targetAlpha = 0.42;
+            targetSelected = 3.0;
+            tr = colorCache[i].r * 0.55;
+            tg = colorCache[i].g * 0.55;
+            tb = colorCache[i].b * 0.55;
           }
         }
 
-        // Hover feedback — a clear but measured scale-up (was 1.22x).
+        // Hover preview: show the subject color at a lifted opacity + bigger,
+        // regardless of selection state. Hover is a preview; click reveals the
+        // full prerequisite + sequel path.
         if (currentHoveredTopic && node.topic.id === currentHoveredTopic.id) {
           targetSize *= 1.3;
-          targetAlpha = 1.0;
+          targetAlpha = Math.max(targetAlpha, 0.7);
+          tr = colorCache[i].r;
+          tg = colorCache[i].g;
+          tb = colorCache[i].b;
         }
       }
 
@@ -425,27 +495,39 @@ export default function ThreeDGraphCanvas({
         animatedSizes[i] = targetSize;
         animatedAlphas[i] = targetAlpha;
         animatedSelected[i] = targetSelected;
+        animatedColors[i * 3] = tr;
+        animatedColors[i * 3 + 1] = tg;
+        animatedColors[i * 3 + 2] = tb;
       } else {
-        // Smooth interpolation for size, alpha, and selection state flags.
-        // A slightly faster lerp makes select/deselect feel snappy yet smooth.
-        animatedSizes[i] += (targetSize - animatedSizes[i]) * 0.2;
-        animatedAlphas[i] += (targetAlpha - animatedAlphas[i]) * 0.2;
-        animatedSelected[i] += (targetSelected - animatedSelected[i]) * 0.2;
+        // Frame-rate-independent damping (0.2 @ 60fps reference). Keeps node
+        // size/opacity/color transitions at the same wall-clock speed on any
+        // display refresh rate.
+        const k = 1 - Math.pow(1 - 0.2, (dt ?? 1 / 60) * 60);
+        animatedSizes[i] += (targetSize - animatedSizes[i]) * k;
+        animatedAlphas[i] += (targetAlpha - animatedAlphas[i]) * k;
+        animatedSelected[i] += (targetSelected - animatedSelected[i]) * k;
+        animatedColors[i * 3] += (tr - animatedColors[i * 3]) * k;
+        animatedColors[i * 3 + 1] += (tg - animatedColors[i * 3 + 1]) * k;
+        animatedColors[i * 3 + 2] += (tb - animatedColors[i * 3 + 2]) * k;
       }
 
       sizes[i] = animatedSizes[i];
       alphas[i] = animatedAlphas[i];
       selectedAttr[i] = animatedSelected[i];
+      colorAttr[i * 3] = animatedColors[i * 3];
+      colorAttr[i * 3 + 1] = animatedColors[i * 3 + 1];
+      colorAttr[i * 3 + 2] = animatedColors[i * 3 + 2];
     });
 
     geometry.attributes.aSize.needsUpdate = true;
     geometry.attributes.aAlpha.needsUpdate = true;
     geometry.attributes.aSelected.needsUpdate = true;
+    geometry.attributes.aColor.needsUpdate = true;
   };
 
   useEffect(() => {
     updateNodeAttributes();
-  }, [nodes, activeTopic, hoveredTopic, hiddenSubjects, selectedPrereqIds]);
+  }, [nodes, activeTopic, hoveredTopic, hiddenSubjects, selectionGraph]);
 
   // Update background connections when subject visibility filters change
   useEffect(() => {
@@ -475,12 +557,25 @@ export default function ThreeDGraphCanvas({
     if (backgroundSoftLinesRef.current) {
       backgroundSoftLinesRef.current.computeLineDistances();
     }
-  }, [activeNodesMap]);
+  }, [activeNodesMap, sceneReady]);
 
-  // Update active prerequisite path lines when selected topic changes.
-  // Active edges are drawn as bowed quadratic-bezier polylines (sampled into
-  // short segments) so the prerequisite trail reads as a connected, separable
-  // path instead of a tangle of overlapping straight lines through the core.
+  // Determine the role color of an active edge (prereq -> topic), both of which
+  // are in the selected related sub-DAG.
+  const edgeRoleColor = (
+    prereqId: string,
+    topicId: string,
+    selId: string,
+    terminalIds: Set<string>
+  ): THREE.Color => {
+    if (topicId === selId) return RGB_PRIMARY.clone(); // primary focus path into selected
+    if (terminalIds.has(prereqId) || terminalIds.has(topicId)) return RGB_TERMINAL.clone();
+    return RGB_BRANCH.clone();
+  };
+
+  // Update active prerequisite + sequel path lines when selected topic changes.
+  // Active edges are bowed quadratic-bezier polylines (sampled into short
+  // segments) so the trail reads as a connected, separable path. Each edge is
+  // colored by its role (white / blue / rose) via per-vertex colors.
   const CURVE_SEGMENTS = 12;
   useEffect(() => {
     const hardGeometry = activeHardGeometryRef.current;
@@ -490,7 +585,9 @@ export default function ThreeDGraphCanvas({
     if (!hardGeometry || !softGeometry || !hardMaterial || !softMaterial) return;
 
     const hardPositions: number[] = [];
+    const hardColors: number[] = [];
     const softPositions: number[] = [];
+    const softColors: number[] = [];
     const activeEdgesList: Array<{
       from: { x: number; y: number; z: number };
       to: { x: number; y: number; z: number };
@@ -500,22 +597,20 @@ export default function ThreeDGraphCanvas({
     }> = [];
 
     if (activeTopic) {
+      const selId = activeTopic.id;
+      const { relatedIds, terminalIds } = selectionGraph;
       for (const dep of dependenciesList) {
-        const isPrereqPath = selectedPrereqIds.has(dep.topicId) && selectedPrereqIds.has(dep.prerequisiteId);
-        if (isPrereqPath) {
+        const isRelatedPath = relatedIds.has(dep.topicId) && relatedIds.has(dep.prerequisiteId);
+        if (isRelatedPath) {
           const fromNode = activeNodesMap.get(dep.prerequisiteId);
           const toNode = activeNodesMap.get(dep.topicId);
           if (fromNode && toNode) {
             const fx = fromNode.x, fy = fromNode.y, fz = fromNode.z;
             const tx = toNode.x, ty = toNode.y, tz = toNode.z;
 
-            // Midpoint of the edge.
             const mx = (fx + tx) / 2;
             const my = (fy + ty) / 2;
             const mz = (fz + tz) / 2;
-            // Push the midpoint radially outward from the funnel's central axis
-            // (the Y axis) so adjacent path edges separate visually. The bow
-            // scales with edge length so short edges stay subtle.
             const radialLen = Math.hypot(mx, mz) || 1;
             const edgeLen = Math.hypot(tx - fx, ty - fy, tz - fz);
             const bow = Math.min(14, edgeLen * 0.18);
@@ -523,111 +618,95 @@ export default function ThreeDGraphCanvas({
             const midY = my;
             const midZ = mz + (mz / radialLen) * bow;
 
-            const edgeColor = new THREE.Color(subjectColor(fromNode.topic.subject));
+            const roleColor = edgeRoleColor(dep.prerequisiteId, dep.topicId, selId, terminalIds);
             activeEdgesList.push({
               from: { x: fx, y: fy, z: fz },
               to: { x: tx, y: ty, z: tz },
               mid: { x: midX, y: midY, z: midZ },
-              color: edgeColor,
+              color: roleColor,
               subject: fromNode.topic.subject
             });
 
-            // Sample the quadratic bezier into CURVE_SEGMENTS connected points
-            // and push them as a continuous line strip (LineSegments needs
-            // pairs, so we emit each consecutive pair).
             let px = fx, py = fy, pz = fz;
-            const target = dep.strength === "soft" ? softPositions : hardPositions;
+            const targetPos = dep.strength === "soft" ? softPositions : hardPositions;
+            const targetCol = dep.strength === "soft" ? softColors : hardColors;
             for (let s = 1; s <= CURVE_SEGMENTS; s++) {
               const t = s / CURVE_SEGMENTS;
               const u = 1 - t;
-              // B(t) = (1-t)^2*P0 + 2(1-t)t*M + t^2*P1
               const cx = u * u * fx + 2 * u * t * midX + t * t * tx;
               const cy = u * u * fy + 2 * u * t * midY + t * t * ty;
               const cz = u * u * fz + 2 * u * t * midZ + t * t * tz;
-              target.push(px, py, pz, cx, cy, cz);
+              targetPos.push(px, py, pz, cx, cy, cz);
+              // Per-vertex color (both endpoints of the segment share the edge role color).
+              targetCol.push(roleColor.r, roleColor.g, roleColor.b, roleColor.r, roleColor.g, roleColor.b);
               px = cx; py = cy; pz = cz;
             }
           }
         }
       }
 
-      // Color active paths matching the subject of the selected topic
-      const activeColor = subjectColor(activeTopic.subject);
-      const colorObj = new THREE.Color(activeColor);
-      hardMaterial.color.copy(colorObj);
-      softMaterial.color.copy(colorObj);
+      // Material color is white so vertex colors pass through unchanged.
+      hardMaterial.color.set(0xffffff);
+      softMaterial.color.set(0xffffff);
     }
 
     activeEdgesRef.current = activeEdgesList;
-    hardGeometry.setAttribute("position", new THREE.Float32BufferAttribute(hardPositions, 3));
-    softGeometry.setAttribute("position", new THREE.Float32BufferAttribute(softPositions, 3));
+    hardGeometry.setPositions(hardPositions);
+    hardGeometry.setColors(hardColors);
+    softGeometry.setPositions(softPositions);
+    softGeometry.setColors(softColors);
     if (activeSoftLinesRef.current) {
       activeSoftLinesRef.current.computeLineDistances();
     }
-  }, [activeTopic, selectedPrereqIds, activeNodesMap]);
+  }, [activeTopic, selectionGraph, activeNodesMap, sceneReady]);
 
-  // Smoothly center the camera and adjust zoom to focus on the selected node
+  // Smoothly frame the camera on the selected node via the framing animation
+  // (lerp controls.target + camera position in the render loop). The camera
+  // orbits to the same side of the funnel as the node so it's always visible,
+  // even when the node was on the back side before selection.
   useEffect(() => {
+    // The first paint is the complete balanced specimen. The scene ref is
+    // populated by the setup effect after this effect on mount.
+    if (!sceneRef.current) return;
     if (activeTopic) {
       const node = nodes.find(n => n.topic.id === activeTopic.id);
       if (node) {
-        // Calculate the rotated position of the node in the current rotation of the graphGroup
-        const localPos = new THREE.Vector3(node.x, node.y, node.z);
-        const euler = new THREE.Euler(rotation.current.x, rotation.current.y, 0, "YXZ");
-        localPos.applyEuler(euler);
-
-        // Center on screen with correct pan scaling:
-        // pan.x * 0.38 + 38.0 = 38.0 - localPos.x => pan.x = -localPos.x / 0.38
-        // -pan.y * 0.38 = -localPos.y => pan.y = localPos.y / 0.38
-        targetPan.current = {
-          x: -localPos.x / 0.38,
-          y: localPos.y / 0.38
+        const nodePos = new THREE.Vector3(node.x, node.y, node.z);
+        // Direction from the funnel's central Y-axis outward through the node.
+        // Positioning the camera along this ray puts it on the same side as
+        // the node, guaranteeing the node faces the camera.
+        const radialDir = new THREE.Vector3(node.x, 0, node.z);
+        if (radialDir.lengthSq() < 0.01) {
+          // Node is on the central axis — keep the current view direction.
+          radialDir.set(0, 0, 1);
+        }
+        radialDir.normalize();
+        // Preserve a similar elevation to the current camera angle.
+        const camPos = nodePos.clone().add(
+          radialDir.multiplyScalar(FRAMING_CAMERA_DISTANCE)
+        );
+        // Lift the camera slightly above the node for a natural 3/4 view.
+        camPos.y += 30;
+        framingAnimRef.current = {
+          active: true,
+          targetPos: nodePos,
+          targetCamPos: camPos,
+          targetDist: FRAMING_CAMERA_DISTANCE,
         };
-        
-        // Slightly zoom in to focus on the active node
-        targetZoom.current = 2.2;
       }
     } else {
-      // If no node is active, reset pan and zoom to baseline overview
-      targetPan.current = { x: 0, y: 0 };
-      targetZoom.current = 1.85;
+      framingAnimRef.current = {
+        active: true,
+        targetPos: new THREE.Vector3(0, 0, 0),
+        targetCamPos: new THREE.Vector3(
+          DEFAULT_CAMERA_POSITION.x,
+          DEFAULT_CAMERA_POSITION.y,
+          DEFAULT_CAMERA_POSITION.z,
+        ),
+        targetDist: DEFAULT_CAMERA_DISTANCE,
+      };
     }
   }, [activeTopic, nodes]);
-
-  // Build the pooled label divs once. Imperative creation avoids rendering
-  // dozens of React nodes and lets the render loop reposition them cheaply.
-  useEffect(() => {
-    const layer = labelLayerRef.current;
-    if (!layer) return;
-    layer.innerHTML = "";
-    const pool: HTMLDivElement[] = [];
-    for (let i = 0; i < LABEL_POOL_SIZE; i++) {
-      const el = document.createElement("div");
-      el.style.position = "absolute";
-      el.style.left = "0";
-      el.style.top = "0";
-      el.style.display = "none";
-      el.style.willChange = "transform";
-      el.style.padding = "3px 6px";
-      el.style.borderRadius = "6px";
-      el.style.border = "1px solid";
-      el.style.background = "rgba(3,6,15,0.72)";
-      el.style.backdropFilter = "blur(4px)";
-      el.style.boxShadow = "0 2px 10px rgba(0,0,0,0.55)";
-      el.style.maxWidth = "150px";
-      el.style.whiteSpace = "nowrap";
-      el.style.overflow = "hidden";
-      el.style.textOverflow = "ellipsis";
-      el.dataset.topicId = "";
-      layer.appendChild(el);
-      pool.push(el);
-    }
-    labelPoolRef.current = pool;
-    return () => {
-      layer.innerHTML = "";
-      labelPoolRef.current = [];
-    };
-  }, []);
 
   // Setup WebGL scene, camera, renderer and render loop
   useEffect(() => {
@@ -638,113 +717,80 @@ export default function ThreeDGraphCanvas({
     const width = rect.width;
     const height = rect.height;
 
-    // --- 1. SETUP THREE.JS SCENE & WEBGL RENDERER ---
+    // --- 1. SCENE & WEBGL RENDERER ---
     const scene = new THREE.Scene();
     sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 2000);
-    camera.position.z = 400;
+    const camera = new THREE.PerspectiveCamera(46, width / height, 0.1, 2000);
+    // Start above and to one side of the specimen. This is a true perspective
+    // 3/4 view, so the radial Z spread and depth occlusion are visible on the
+    // first frame instead of looking like a stack of front-facing rings.
+    camera.position.set(
+      DEFAULT_CAMERA_POSITION.x,
+      DEFAULT_CAMERA_POSITION.y,
+      DEFAULT_CAMERA_POSITION.z,
+    );
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({
       canvas,
       antialias: true,
       alpha: false,
-      premultipliedAlpha: false
+      premultipliedAlpha: false,
+      powerPreference: "high-performance",
     });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(width, height, false);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.setClearColor(0x090b11, 1.0);
+    renderer.setClearColor(0x0b0e14, 1.0);
     rendererRef.current = renderer;
 
-    // Main rotating group holding all graph entities
+    // Main group holding all graph entities. With OrbitControls the graph
+    // stays at the origin — the camera orbits instead of the group rotating.
     const graphGroup = new THREE.Group();
     scene.add(graphGroup);
     graphGroupRef.current = graphGroup;
 
-    // --- 2. SETUP SPATIAL GROUNDING HUD (Axis & Funnel Rings) ---
-    // Central Axis Spine - Glowing Jagged Lightning/Thunder Bolt Core
-    const spinePoints: THREE.Vector3[] = [];
-    for (let y = -125; y <= 125; y += 4) {
-      const offset = getLightningOffset(y);
-      spinePoints.push(new THREE.Vector3(offset.x, y, offset.z));
-    }
-    const spineGeometry = new THREE.BufferGeometry().setFromPoints(spinePoints);
-    const spineMaterial = new THREE.LineBasicMaterial({
-      color: 0x00f0ff, // Cyber Electric Cyan
-      transparent: true,
-      opacity: 0.65,
-      depthWrite: false
-    });
-    const spineLine = new THREE.Line(spineGeometry, spineMaterial);
-    spineLine.visible = true;
-    graphGroup.add(spineLine);
+    // --- 2. ORBIT CONTROLS ---
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.065;
+    controls.minDistance = 120;
+    controls.maxDistance = 800;
+    controls.minPolarAngle = 0.1;
+    controls.maxPolarAngle = Math.PI - 0.1;
+    controls.autoRotateSpeed = 0.16;
+    controls.rotateSpeed = 0.52;
+    controls.zoomSpeed = 0.8;
+    controls.panSpeed = 0.7;
+    controls.screenSpacePanning = true;
+    controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+    // Aim a little above the specimen's midpoint so the full funnel sits
+    // lower in the viewport, leaving the headline and brand area clear.
+    controls.target.set(0, 0, 0);
+    controls.update();
+    controlsRef.current = controls;
 
-    // Inner core for extreme brightness to sell the lightning effect
-    const spineCoreMaterial = new THREE.LineBasicMaterial({
-      color: 0xffffff, // Pure white inner electric core
-      transparent: true,
-      opacity: 0.85,
-      depthWrite: false
-    });
-    const spineCoreLine = new THREE.Line(spineGeometry, spineCoreMaterial);
-    spineCoreLine.visible = true;
-    graphGroup.add(spineCoreLine);
-
-    // Three Reference Rings
-    const createRingGeometry = (r: number) => {
-      const points: THREE.Vector3[] = [];
-      const segments = 64;
-      for (let i = 0; i <= segments; i++) {
-        const theta = (i / segments) * Math.PI * 2;
-        points.push(new THREE.Vector3(r * Math.cos(theta), 0, r * Math.sin(theta)));
-      }
-      return new THREE.BufferGeometry().setFromPoints(points);
-    };
-
-    const ringsConfig = [
-      { r: 12, y: -120, color: 0xff007f, opacity: 0.35 }, // Pinkish Foundation (age 4)
-      { r: 72, y: 0, color: 0xcc00ff, opacity: 0.22 },    // Purpleish Developing (age 9)
-      { r: 172, y: 120, color: 0x00f0ff, opacity: 0.18 }  // Cyan Specialization (age 15)
-    ];
-
-    const ringsData = ringsConfig.map(cfg => {
-      const geo = createRingGeometry(cfg.r);
-      const mat = new THREE.LineBasicMaterial({
-        color: cfg.color,
-        transparent: true,
-        opacity: cfg.opacity,
-        visible: true,
-        depthWrite: false
-      });
-      const line = new THREE.LineLoop(geo, mat);
-      line.visible = true;
-      line.position.y = cfg.y;
-      graphGroup.add(line);
-      return { geometry: geo, material: mat, line };
-    });
-
-    // --- 3. BACKGROUND CONNECTIONS (EDGES) ---
+    // --- 3. BACKGROUND CONNECTIONS (ultra-faint spiderweb) ---
     const hardEdgesGeometry = new THREE.BufferGeometry();
     const softEdgesGeometry = new THREE.BufferGeometry();
 
     const hardEdgesMaterial = new THREE.LineBasicMaterial({
-      color: 0xffffff,
+      color: 0x334155,
       transparent: true,
-      opacity: 0.12,
+      opacity: 0.06,
       depthWrite: false,
-      blending: THREE.NormalBlending
+      blending: THREE.NormalBlending,
     });
 
     const softEdgesMaterial = new THREE.LineDashedMaterial({
-      color: 0xffffff,
+      color: 0x334155,
       dashSize: 4,
       gapSize: 4,
       transparent: true,
-      opacity: 0.08,
+      opacity: 0.04,
       depthWrite: false,
-      blending: THREE.NormalBlending
+      blending: THREE.NormalBlending,
     });
 
     const backgroundHardLines = new THREE.LineSegments(hardEdgesGeometry, hardEdgesMaterial);
@@ -752,283 +798,228 @@ export default function ThreeDGraphCanvas({
     graphGroup.add(backgroundHardLines);
     graphGroup.add(backgroundSoftLines);
 
-    // Save stable references
     hardEdgesGeometryRef.current = hardEdgesGeometry;
     softEdgesGeometryRef.current = softEdgesGeometry;
     backgroundSoftLinesRef.current = backgroundSoftLines;
     hardEdgesMaterialRef.current = hardEdgesMaterial;
     softEdgesMaterialRef.current = softEdgesMaterial;
 
-    // --- 4. ACTIVE CONNECTIONS (PREREQUISITE TRACING PATHS) ---
-    const activeHardGeometry = new THREE.BufferGeometry();
-    const activeSoftGeometry = new THREE.BufferGeometry();
+    // --- 4. ACTIVE CONNECTIONS (role-colored prerequisite + sequel paths) ---
+    const activeHardGeometry = new LineSegmentsGeometry();
+    const activeSoftGeometry = new LineSegmentsGeometry();
 
-    const activeHardMaterial = new THREE.LineBasicMaterial({
+    const activeHardMaterial = new LineMaterial({
       color: 0xffffff,
       transparent: true,
       opacity: 0.0,
-      linewidth: 3,
+      linewidth: 1.55,
+      worldUnits: false,
+      vertexColors: true,
       depthWrite: false,
-      depthTest: false, // Draw on top of nodes so the path is always readable.
-      blending: THREE.NormalBlending
+      // Active paths sit above the dim context web and nodes so the selected
+      // dependency route remains readable through a dense cluster.
+      depthTest: false,
     });
 
-    const activeSoftMaterial = new THREE.LineDashedMaterial({
+    const activeSoftMaterial = new LineMaterial({
       color: 0xffffff,
-      dashSize: 5,
-      gapSize: 5,
       transparent: true,
       opacity: 0.0,
+      linewidth: 1.15,
+      worldUnits: false,
+      vertexColors: true,
       depthWrite: false,
       depthTest: false,
-      blending: THREE.NormalBlending
+      dashed: true,
+      dashSize: 5,
+      gapSize: 5,
     });
 
-    const activeHardLines = new THREE.LineSegments(activeHardGeometry, activeHardMaterial);
-    const activeSoftLines = new THREE.LineSegments(activeSoftGeometry, activeSoftMaterial);
-    // Render after nodes/particles so the prerequisite trail is always visible.
+    activeHardMaterial.resolution.set(width, height);
+    activeSoftMaterial.resolution.set(width, height);
+
+    const activeHardLines = new LineSegments2(activeHardGeometry, activeHardMaterial);
+    const activeSoftLines = new LineSegments2(activeSoftGeometry, activeSoftMaterial);
     activeHardLines.renderOrder = 4;
     activeSoftLines.renderOrder = 4;
     graphGroup.add(activeHardLines);
     graphGroup.add(activeSoftLines);
 
-    // Save active line refs
     activeHardGeometryRef.current = activeHardGeometry;
     activeSoftGeometryRef.current = activeSoftGeometry;
     activeSoftLinesRef.current = activeSoftLines;
     activeHardMaterialRef.current = activeHardMaterial;
     activeSoftMaterialRef.current = activeSoftMaterial;
 
-    // --- 6. NODES SYSTEM (Shader-based Billboards) ---
+    // --- 5. NODES (restrained perspective point sprites) ---
     const pointsGeometry = new THREE.BufferGeometry();
     const positions = new Float32Array(nodes.length * 3);
     const colors = new Float32Array(nodes.length * 3);
     const sizes = new Float32Array(nodes.length);
     const alphas = new Float32Array(nodes.length);
     const selectedAttr = new Float32Array(nodes.length);
-    const milestoneAttr = new Float32Array(nodes.length);
 
-    // Map subject color hexes into float arrays
-    const colorCache = nodes.map(node => new THREE.Color(node.color));
     nodes.forEach((node, i) => {
       positions[i * 3] = node.x;
       positions[i * 3 + 1] = node.y;
       positions[i * 3 + 2] = node.z;
-
-      colors[i * 3] = colorCache[i].r;
-      colors[i * 3 + 1] = colorCache[i].g;
-      colors[i * 3 + 2] = colorCache[i].b;
-
-      milestoneAttr[i] = node.isMilestone ? 1.0 : 0.0;
     });
 
     pointsGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     pointsGeometry.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
     pointsGeometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
     pointsGeometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
-    pointsGeometry.setAttribute("aMilestone", new THREE.BufferAttribute(milestoneAttr, 1));
     pointsGeometry.setAttribute("aSelected", new THREE.BufferAttribute(selectedAttr, 1));
 
-    // Store geometry reference
     pointsGeometryRef.current = pointsGeometry;
 
     const pointsMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        uZoom: { value: 1.0 },
-        uScale: { value: 1.0 },
-        uGlobalAlpha: { value: 1.0 },
-        uTime: { value: 0.0 }
-      },
       vertexShader: POINTS_VERTEX_SHADER,
       fragmentShader: POINTS_FRAGMENT_SHADER,
-      transparent: false,
+      transparent: true,
+      // Points must participate in the depth buffer. Without depth writes,
+      // overlapping sprites are composited in submission order and the graph
+      // reads as a flat scatterplot even though the coordinates are 3D.
       depthWrite: true,
       depthTest: true,
-      blending: THREE.NormalBlending
+      // NormalBlending renders the solid opaque discs (matches the reference).
+      // AdditiveBlending was what gave the old glow; opaque fill + normal
+      // blending reads as crisp filled dots instead.
+      blending: THREE.NormalBlending,
     });
 
     pointsMaterialRef.current = pointsMaterial;
 
     const points = new THREE.Points(pointsGeometry, pointsMaterial);
+    points.renderOrder = 1;
     graphGroup.add(points);
 
-    // --- 5. PARTICLE SYSTEM FOR PREREQUISITE FLOW ---
-    const maxParticles = 300;
-    const particleGeometry = new THREE.BufferGeometry();
-    const particlePositions = new Float32Array(maxParticles * 3);
-    const particleColors = new Float32Array(maxParticles * 3);
-    const particleSizes = new Float32Array(maxParticles);
-    const particleAlphas = new Float32Array(maxParticles);
-
-    particleGeometry.setAttribute("position", new THREE.BufferAttribute(particlePositions, 3));
-    particleGeometry.setAttribute("aColor", new THREE.BufferAttribute(particleColors, 3));
-    particleGeometry.setAttribute("aSize", new THREE.BufferAttribute(particleSizes, 1));
-    particleGeometry.setAttribute("aAlpha", new THREE.BufferAttribute(particleAlphas, 1));
-
-    const particleMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        uZoom: { value: 1.0 },
-        uGlobalAlpha: { value: 1.0 }
-      },
-      vertexShader: PARTICLE_VERTEX_SHADER,
-      fragmentShader: PARTICLE_FRAGMENT_SHADER,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.NormalBlending
-    });
-
-    particleMaterialRef.current = particleMaterial;
-
-    const particlePoints = new THREE.Points(particleGeometry, particleMaterial);
-    graphGroup.add(particlePoints);
-
-    // --- 5b. SELECTION HALO (billboarded ring tracking the selected node) ---
-    // A screen-facing ring drawn at the selected node's world position. It is
-    // added to the scene (not graphGroup) and repositioned each frame via
-    // getWorldPosition, then oriented to face the camera. Opacity lerps in/out
-    // so selecting/deselecting feels smooth. Per threejs-geometry, RingGeometry
-    // is the right primitive for a flat annulus.
-    const haloGeometry = new THREE.RingGeometry(2.4, 3.0, 48);
-    const haloMaterial = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
+    // --- 6. SINGLE-RING SELECTION OUTLINE ---
+    // One billboarded ring tracking the selected node. Added to the scene
+    // (not graphGroup) so it doesn't inherit graph rotation.
+    const ringPoints: THREE.Vector3[] = [];
+    const ringSegments = 64;
+    for (let i = 0; i <= ringSegments; i++) {
+      const theta = (i / ringSegments) * Math.PI * 2;
+      ringPoints.push(new THREE.Vector3(3.2 * Math.cos(theta), 3.2 * Math.sin(theta), 0));
+    }
+    const innerRingGeo = new THREE.BufferGeometry().setFromPoints(ringPoints);
+    const innerRingMat = new THREE.LineBasicMaterial({
+      color: 0xf8fafc,
       transparent: true,
       opacity: 0.0,
       depthWrite: false,
       depthTest: false,
-      side: THREE.DoubleSide,
-      blending: THREE.AdditiveBlending
+      blending: THREE.NormalBlending,
     });
-    const selectionHalo = new THREE.Mesh(haloGeometry, haloMaterial);
-    selectionHalo.visible = false;
-    selectionHalo.renderOrder = 5; // Draw on top of the node sprites
-    scene.add(selectionHalo);
-    selectionHaloRef.current = selectionHalo;
-
-    interface ParticleState {
-      edgeIndex: number;
-      t: number;
-      speed: number;
-      size: number;
-      offsetAngle: number;
-      offsetRadius: number;
-    }
-
-    const particles: ParticleState[] = [];
-    for (let i = 0; i < maxParticles; i++) {
-      particles.push({
-        edgeIndex: -1,
-        t: Math.random(), // Stagger start points
-        speed: 0.0022 + Math.random() * 0.005, // calmer flow speed
-        size: 3.5 + Math.random() * 4.0,
-        offsetAngle: Math.random() * Math.PI * 2,
-        offsetRadius: 0.2 + Math.random() * 1.5
-      });
-    }
+    const selectionRingInner = new THREE.LineLoop(innerRingGeo, innerRingMat);
+    selectionRingInner.visible = false;
+    selectionRingInner.renderOrder = 5;
+    scene.add(selectionRingInner);
+    selectionRingInnerRef.current = selectionRingInner;
 
     // --- 7. ANIMATION FRAME LOOP ---
-    let animationFrameId: number;
+    let animationFrameId = 0;
 
-    // Reusable scratch objects for the render loop (avoid per-frame allocation).
-    const haloWorldPos = new THREE.Vector3();
-    const haloColorCache: Record<string, THREE.Color> = {
-      __default: new THREE.Color("#ffffff")
-    };
-    for (const [k, v] of Object.entries(SUBJECT_COLORS)) {
-      haloColorCache[k] = new THREE.Color(v);
-    }
+    // Reusable scratch objects for the render loop (avoid per-frame
+    // allocation while projecting the dense graph).
+    const ringWorldPos = new THREE.Vector3();
+    const tempV = new THREE.Vector3();
+
+    // Last frame timestamp for frame-rate-independent damping. clamped so a
+    // backgrounded tab (huge dt) doesn't fast-forward the animation.
+    let lastFrameTime = performance.now();
 
     const render = () => {
-      // Smooth interpolation for dragging, panning, zooming
-      rotation.current.x += (targetRotation.current.x - rotation.current.x) * 0.08;
-      rotation.current.y += (targetRotation.current.y - rotation.current.y) * 0.08;
-      zoom.current += (targetZoom.current - zoom.current) * 0.08;
-      pan.current.x += (targetPan.current.x - pan.current.x) * 0.08;
-      pan.current.y += (targetPan.current.y - pan.current.y) * 0.08;
-
-      // Gentle drift rotation when idle and auto-rotate is enabled by the user.
-      // Auto-rotate is off by default so the graph stays still while reading.
-      if (autoRotateRef.current && !isDragging.current && Date.now() - lastInteractionTime.current > 4000) {
-        targetRotation.current.y += 0.0006;
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - lastFrameTime) / 1000);
+      lastFrameTime = now;
+      // --- Framing animation (smooth target + camera orbit transitions) ---
+      const framing = framingAnimRef.current;
+      if (framing.active && !pointerActiveRef.current) {
+        // 0.08 → ~370ms half-life at 60fps; damp() keeps that constant across
+        // frame rates. Under reduced motion we snap instead of easing, since
+        // this is a camera move (position animation).
+        if (prefersReducedMotion) {
+          controls.target.copy(framing.targetPos);
+          camera.position.copy(framing.targetCamPos);
+          framing.active = false;
+        } else {
+          controls.target.lerp(framing.targetPos, 1 - Math.pow(1 - 0.08, dt * 60));
+          camera.position.lerp(framing.targetCamPos, 1 - Math.pow(1 - 0.08, dt * 60));
+          if (controls.target.distanceTo(framing.targetPos) < 0.5 &&
+              camera.position.distanceTo(framing.targetCamPos) < 1.0) {
+            framing.active = false;
+          }
+        }
       }
 
-      // Apply coordinates to the Three.js group
-      graphGroup.rotation.y = rotation.current.y;
-      graphGroup.rotation.x = rotation.current.x;
+      // --- Auto-rotate with idle gating ---
+      // Disabled under reduced-motion: it's continuous positional motion the
+      // user didn't initiate.
+      controls.autoRotate = autoRotateRef.current
+        && !prefersReducedMotion
+        && !pointerActiveRef.current
+        && (Date.now() - lastInteractionTime.current > 4000);
 
-      // Convert 2D screen pan offset to WebGL units, with a constant +38.0 shift to shift the graph ~100px to the right
-      graphGroup.position.x = (pan.current.x * 0.38) + 38.0;
-      graphGroup.position.y = -pan.current.y * 0.38;
+      controls.update();
+
+      // graphGroup stays at identity — no rotation/position to set.
       graphGroup.updateMatrixWorld(true);
 
-      // Set zoom uniforms
-      pointsMaterial.uniforms.uZoom.value = zoom.current;
-      particleMaterial.uniforms.uZoom.value = zoom.current;
-      // Drive the milestone halo pulse.
-      pointsMaterial.uniforms.uTime.value = performance.now() * 0.001;
-
       // Update node attributes dynamically
-      updateNodeAttributes();
+      updateNodeAttributes(false, dt);
 
-      // Project all coordinates to screen-space for hover tracking and HTML HUD positioning
-      const tempV = new THREE.Vector3();
-      const cssW = canvas.width / (window.devicePixelRatio || 1);
-      const cssH = canvas.height / (window.devicePixelRatio || 1);
+      // Project all coordinates to screen-space for hover tracking and HTML HUD positioning.
+      const cssW = canvas.clientWidth || canvas.width / (window.devicePixelRatio || 1);
+      const cssH = canvas.clientHeight || canvas.height / (window.devicePixelRatio || 1);
 
-      // Handle Bokeh focus and edge opacities based on selected node with smooth interpolation
+      // Edge opacity transitions
       const currentActiveTopic = activeTopicRef.current;
-      // Background edges recede when a topic is selected so the active path
-      // stands out; slightly lowered base opacity reduces baseline visual noise.
-      const targetHardOpacity = currentActiveTopic ? 0.05 : 0.11;
-      const targetSoftOpacity = currentActiveTopic ? 0.03 : 0.07;
-      // Active prerequisite path edges render at full opacity for readability.
-      const targetActiveHardOpacity = currentActiveTopic ? 1.0 : 0.0;
-      const targetActiveSoftOpacity = currentActiveTopic ? 1.0 : 0.0;
+      const targetHardOpacity = currentActiveTopic ? 0.04 : 0.06;
+      const targetSoftOpacity = currentActiveTopic ? 0.03 : 0.04;
+      const targetActiveHardOpacity = currentActiveTopic ? 0.95 : 0.0;
+      const targetActiveSoftOpacity = currentActiveTopic ? 0.75 : 0.0;
 
       if (hardEdgesMaterialRef.current) {
-        hardEdgesMaterialRef.current.opacity += (targetHardOpacity - hardEdgesMaterialRef.current.opacity) * 0.08;
+        hardEdgesMaterialRef.current.opacity = damp(hardEdgesMaterialRef.current.opacity, targetHardOpacity, 0.08, dt);
       }
       if (softEdgesMaterialRef.current) {
-        softEdgesMaterialRef.current.opacity += (targetSoftOpacity - softEdgesMaterialRef.current.opacity) * 0.08;
+        softEdgesMaterialRef.current.opacity = damp(softEdgesMaterialRef.current.opacity, targetSoftOpacity, 0.08, dt);
       }
-      // Node dimming is handled by per-node vAlpha mixed toward background in the shader.
-      // No global alpha reduction needed — that was causing the cloudy look.
       if (activeHardMaterialRef.current) {
-        activeHardMaterialRef.current.opacity += (targetActiveHardOpacity - activeHardMaterialRef.current.opacity) * 0.08;
+        activeHardMaterialRef.current.opacity = damp(activeHardMaterialRef.current.opacity, targetActiveHardOpacity, 0.08, dt);
       }
       if (activeSoftMaterialRef.current) {
-        activeSoftMaterialRef.current.opacity += (targetActiveSoftOpacity - activeSoftMaterialRef.current.opacity) * 0.08;
+        activeSoftMaterialRef.current.opacity = damp(activeSoftMaterialRef.current.opacity, targetActiveSoftOpacity, 0.08, dt);
       }
 
-      projectedCoordsRef.current = nodesRef.current
-        .filter(n => !hiddenSubjectsRef.current.has(n.topic.subject))
-        .map(node => {
-          tempV.set(node.x, node.y, node.z);
-          tempV.applyMatrix4(graphGroup.matrixWorld);
-          tempV.project(camera);
+      const projectedCoords = projectedCoordsRef.current;
+      const currentNodes = nodesRef.current;
+      for (let i = 0; i < currentNodes.length; i++) {
+        const node = currentNodes[i];
+        const projected = projectedCoords[i];
+        projected.visible = !hiddenSubjectsRef.current.has(node.topic.subject);
+        if (!projected.visible) continue;
 
-          const sx = (tempV.x * 0.5 + 0.5) * cssW;
-          const sy = (-tempV.y * 0.5 + 0.5) * cssH;
-
-          return {
-            topic: node.topic,
-            sx,
-            sy,
-            zDepth: tempV.z,
-            color: node.color,
-            baseRadius: node.baseRadius,
-            isMilestone: node.isMilestone
-          };
-        });
+        tempV.set(node.x, node.y, node.z);
+        tempV.applyMatrix4(graphGroup.matrixWorld);
+        tempV.project(camera);
+        projected.sx = (tempV.x * 0.5 + 0.5) * cssW;
+        projected.sy = (-tempV.y * 0.5 + 0.5) * cssH;
+        projected.zDepth = tempV.z;
+      }
 
       // Perform precise hover detection with camera depth priority
       if (mousePosRef.current) {
         const mouseX = mousePosRef.current.x;
         const mouseY = mousePosRef.current.y;
         let closestNode: typeof projectedCoordsRef.current[0] | null = null;
-        let minDistanceSq = 16 * 16; // 16px hover target radius squared
+        let minDistanceSq = 16 * 16;
         let bestDepth = Infinity;
 
-        for (const node of projectedCoordsRef.current) {
+        for (const node of projectedCoords) {
+          if (!node.visible) continue;
           const dx = mouseX - node.sx;
           const dy = mouseY - node.sy;
           const distSq = dx * dx + dy * dy;
@@ -1042,9 +1033,7 @@ export default function ThreeDGraphCanvas({
         }
 
         if (closestNode) {
-          // Cursor feedback is immediate; the hover card waits for a short
-          // dwell so sweeping across a dense cluster doesn't strobe its text.
-          if (!isDragging.current && canvas.style.cursor !== "pointer") {
+          if (!pointerActiveRef.current && canvas.style.cursor !== "pointer") {
             canvas.style.cursor = "pointer";
           }
           const candId = closestNode.topic.id;
@@ -1052,95 +1041,68 @@ export default function ThreeDGraphCanvas({
           if (dwell.id !== candId) {
             dwell.id = candId;
             dwell.since = performance.now();
+            // Skip the dwell once a tooltip has shown this session: hovering
+            // adjacent nodes reveals them instantly, making the whole canvas
+            // feel fast without defeating the initial-entry delay.
+            if (tooltipOpenedRef.current && hoveredTopicRef.current?.id !== candId) {
+              setHoveredTopic(closestNode.topic);
+            }
           } else if (hoveredTopicRef.current?.id !== candId && performance.now() - dwell.since >= HOVER_DWELL_MS) {
             setHoveredTopic(closestNode.topic);
+            tooltipOpenedRef.current = true;
           }
         } else {
           hoverDwellRef.current = { id: null, since: 0 };
           if (hoveredTopicRef.current !== null) {
             setHoveredTopic(null);
           }
-          if (!isDragging.current && canvas.style.cursor !== "default") {
-            canvas.style.cursor = "default";
+          if (!pointerActiveRef.current && canvas.style.cursor !== "grab") {
+            canvas.style.cursor = "grab";
           }
         }
       }
 
-      // --- Selection halo: follow the selected node in world space and pulse. ---
-      const halo = selectionHaloRef.current;
-      if (halo) {
+      // --- Double-ring selection outline ---
+      const ringInner = selectionRingInnerRef.current;
+      if (ringInner) {
         const selTopic = activeTopicRef.current;
         const targetOpacity = selTopic ? 0.9 : 0.0;
-        selectionHaloOpacityRef.current += (targetOpacity - selectionHaloOpacityRef.current) * 0.12;
+        // The focus marker is deliberately static: no pulse, scale tween, or
+        // fade animation competes with reading the dependency path.
+        selectionRingOpacityRef.current = targetOpacity;
 
-        const haloNode = selTopic ? nodeByTopicIdRef.current.get(selTopic.id) : null;
-        if (haloNode && selectionHaloOpacityRef.current > 0.01) {
-          // World position of the selected node (accounts for graphGroup rotation+pan).
-          haloWorldPos.set(haloNode.x, haloNode.y, haloNode.z);
-          haloWorldPos.applyMatrix4(graphGroup.matrixWorld);
-          halo.position.copy(haloWorldPos);
-          // Billboard: face the camera so the ring always reads as a circle.
-          halo.quaternion.copy(camera.quaternion);
-          // Gentle scale pulse + slight distance-based sizing so it stays visible.
-          const pulse = 1.0 + 0.12 * Math.sin(performance.now() * 0.004);
-          const distScale = Math.max(0.6, Math.min(2.2, haloWorldPos.distanceTo(camera.position) / 220));
-          halo.scale.setScalar(pulse * distScale);
-          (halo.material as THREE.MeshBasicMaterial).opacity = selectionHaloOpacityRef.current;
-          // Tint the halo to the selected node's subject color for consistency.
-          const c = haloColorCache[haloNode.topic.subject] || haloColorCache.__default;
-          (halo.material as THREE.MeshBasicMaterial).color.copy(c);
-          halo.visible = true;
-        } else if (selectionHaloOpacityRef.current < 0.01) {
-          halo.visible = false;
+        const ringNode = selTopic ? nodeByTopicIdRef.current.get(selTopic.id) : null;
+        if (ringNode && selectionRingOpacityRef.current > 0.01) {
+          ringWorldPos.set(ringNode.x, ringNode.y, ringNode.z);
+          ringWorldPos.applyMatrix4(graphGroup.matrixWorld);
+          // Pulse disabled under reduced-motion (constant 1.0); the opacity
+          // fade-in and size lift still convey selection without oscillation.
+          const distScale = Math.max(0.78, Math.min(1.2, ringWorldPos.distanceTo(camera.position) / 320));
+          const scale = distScale;
+
+          ringInner.position.copy(ringWorldPos);
+          ringInner.quaternion.copy(camera.quaternion);
+          ringInner.scale.setScalar(scale);
+          (ringInner.material as THREE.LineBasicMaterial).opacity = selectionRingOpacityRef.current;
+          ringInner.visible = true;
+        } else if (selectionRingOpacityRef.current < 0.01) {
+          ringInner.visible = false;
         }
       }
 
-      // Update absolute HTML HUD labels positioning
-      const updateRingLabel = (el: HTMLDivElement | null, rx: number, ry: number, rz: number, labelText: string) => {
-        if (!el) return;
-        tempV.set(rx, ry, rz);
-        tempV.applyMatrix4(graphGroup.matrixWorld);
-        tempV.project(camera);
-
-        const sx = (tempV.x * 0.5 + 0.5) * cssW;
-        const sy = (-tempV.y * 0.5 + 0.5) * cssH;
-
-        if (tempV.z > 1.0) {
-          el.style.display = "none";
-        } else {
-          el.style.display = "block";
-          el.style.transform = `translate(${sx + 10}px, ${sy - 4}px)`;
-          el.textContent = labelText;
-        }
-      };
-
-      updateRingLabel(labelBottomRef.current, 12, -120, 0, "FOUNDATION (AGE 4)");
-      updateRingLabel(labelMiddleRef.current, 72, 0, 0, "DEVELOPING (AGE 9)");
-      updateRingLabel(labelTopRef.current, 172, 120, 0, "SPECIALIZATION (AGE 15)");
-
       // Update hover detail card position + content. Card is always mounted;
-      // we toggle opacity and write content imperatively from the latest
-      // hovered topic each frame (avoids React re-renders and first-frame
-      // flash at 0,0). Mouse hover takes priority; otherwise the touch-pinned
-      // topic (a mobile tap selection) is shown until cleared.
+      // opacity and position toggled imperatively from the render loop.
       const currentHovered = hoveredTopicRef.current ?? touchPinnedTopicRef.current;
       const tooltipEl = tooltipRef.current;
       if (tooltipEl) {
         if (currentHovered) {
-          const proj = projectedCoordsRef.current.find(p => p.topic.id === currentHovered.id);
+          const proj = projectedCoordsRef.current.find(p => p.visible && p.topic.id === currentHovered.id);
           if (proj) {
-            // Populate card content (only rewrite text when the node changed).
             const hoverColor = subjectColor(currentHovered.subject);
-            if (tooltipBarRef.current) tooltipBarRef.current.style.backgroundColor = hoverColor;
-            if (tooltipDomainRef.current && tooltipDomainRef.current.dataset.id !== currentHovered.id) {
-              tooltipDomainRef.current.dataset.id = currentHovered.id;
-              // Domain label stays a fixed neutral; the color bar is the sole
-              // subject signal (neon text reads as a debug overlay + is harsh).
-              tooltipDomainRef.current.textContent = currentHovered.domain;
-            }
-            if (tooltipAgeRef.current && tooltipAgeRef.current.dataset.id !== currentHovered.id) {
-              tooltipAgeRef.current.dataset.id = currentHovered.id;
-              tooltipAgeRef.current.textContent = `AGE ${currentHovered.ageRangeStart}–${currentHovered.ageRangeEnd}`;
+            if (tooltipDotRef.current) tooltipDotRef.current.style.backgroundColor = hoverColor;
+            if (tooltipMetaRef.current && tooltipMetaRef.current.dataset.id !== currentHovered.id) {
+              tooltipMetaRef.current.dataset.id = currentHovered.id;
+              tooltipMetaRef.current.textContent = `${currentHovered.subject.toUpperCase()} · AGE ${currentHovered.ageRangeStart}–${currentHovered.ageRangeEnd}`;
             }
             if (tooltipTitleRef.current && tooltipTitleRef.current.dataset.id !== currentHovered.id) {
               tooltipTitleRef.current.dataset.id = currentHovered.id;
@@ -1148,22 +1110,30 @@ export default function ThreeDGraphCanvas({
             }
             if (tooltipDescRef.current && tooltipDescRef.current.dataset.id !== currentHovered.id) {
               tooltipDescRef.current.dataset.id = currentHovered.id;
-              // One truncation layer: the CSS line-clamp-2 handles the ellipsis.
               tooltipDescRef.current.textContent = currentHovered.description || "";
             }
 
-            // Measure: re-measure whenever the shown topic changes (text length
-            // drives height) or after a re-show. Cached per topic per show.
             let dims = tooltipDimsRef.current;
             if (!dims || dims.id !== currentHovered.id) {
               dims = { id: currentHovered.id, w: tooltipEl.offsetWidth, h: tooltipEl.offsetHeight };
               tooltipDimsRef.current = dims;
+              // New target → restart the reveal from the scaled-down start so
+              // the card grows out of its node.
+              tooltipScaleRef.current = prefersReducedMotion ? 1 : TOOLTIP_REVEAL_SCALE;
             }
-            // Placement is a pure decision (see placeTooltip); apply it here.
             const place = placeTooltip(proj.sx, proj.sy, dims.w, dims.h, cssW, cssH);
+            // Ease the reveal scale toward 1 (open). ~150ms feel.
+            tooltipScaleRef.current = damp(tooltipScaleRef.current, 1, 0.2, dt);
             tooltipEl.style.left = `${place.left}px`;
             tooltipEl.style.top = `${place.top}px`;
-            tooltipEl.style.transform = place.transform;
+            // Compose the placement translate with an origin-aware scale: when
+            // the card sits above the node it grows from its bottom edge
+            // (toward the node); when below, from its top edge.
+            const origin = place.transform === "translate(-50%, -100%)"
+              ? "bottom center"
+              : "top center";
+            tooltipEl.style.transformOrigin = origin;
+            tooltipEl.style.transform = `${place.transform} scale(${tooltipScaleRef.current.toFixed(3)})`;
             tooltipEl.style.opacity = "1";
           } else {
             tooltipEl.style.opacity = "0";
@@ -1175,159 +1145,6 @@ export default function ThreeDGraphCanvas({
         }
       }
 
-      // --- Smart node labels ---
-      // Position pooled label divs over the nodes that should be labeled
-      // (milestones + selected + prerequisite path + hovered). We reuse the
-      // screen-space projection already computed above.
-      // On hover, ALL other labels are suppressed so the canvas stays calm and
-      // attention focuses on the hovered node (the hover card shows its detail).
-      const labelPool = labelPoolRef.current;
-      const labeledIds = labeledNodeIdsRef.current;
-      const nodeById = nodeByTopicIdRef.current;
-      const hovering = !!hoveredTopicRef.current;
-      let labelSlot = 0;
-      for (const proj of projectedCoordsRef.current) {
-        if (labelSlot >= labelPool.length) break;
-        if (!labeledIds.has(proj.topic.id)) continue;
-        // While hovering, show only the hovered node's label.
-        if (hovering && proj.topic.id !== hoveredTopicRef.current!.id) continue;
-        // Skip labels behind the camera or far off-screen.
-        if (proj.zDepth > 1 || proj.zDepth < -1) continue;
-        if (proj.sx < -50 || proj.sx > cssW + 50 || proj.sy < -50 || proj.sy > cssH + 50) continue;
-
-        const node = nodeById.get(proj.topic.id);
-        if (!node) continue;
-
-        const el = labelPool[labelSlot++];
-        el.style.display = "block";
-        // Offset label up-right from the node center, scaled to node radius.
-        const offX = 8;
-        const offY = 14;
-        el.style.transform = `translate(${proj.sx + offX}px, ${proj.sy - offY}px)`;
-
-        const isSelected = activeTopicRef.current?.id === proj.topic.id;
-        const color = proj.color;
-        el.style.borderColor = `${color}${isSelected ? "80" : "40"}`;
-        el.style.color = isSelected ? "#ffffff" : `${color}ee`;
-        // Keep label DOM stable: only rewrite text when it changed.
-        if (el.dataset.topicId !== proj.topic.id) {
-          el.dataset.topicId = proj.topic.id;
-          el.innerHTML =
-            `<div class="font-sans font-semibold leading-tight" style="font-size:11px">${escapeHtml(proj.topic.name)}</div>` +
-            `<div class="font-mono leading-none tracking-wider" style="font-size:8.5px;color:${color}cc;opacity:.85">${escapeHtml(proj.topic.subject.toUpperCase())} · AGE ${proj.topic.ageRangeStart}</div>`;
-        }
-      }
-      // Hide any pooled labels we didn't use this frame.
-      for (; labelSlot < labelPool.length; labelSlot++) {
-        const el = labelPool[labelSlot];
-        if (el.style.display !== "none") {
-          el.style.display = "none";
-          el.dataset.topicId = "";
-        }
-      }
-
-      // Update particle positions and attributes dynamically
-      const posAttr = particleGeometry.getAttribute("position") as THREE.BufferAttribute;
-      const colorAttr = particleGeometry.getAttribute("aColor") as THREE.BufferAttribute;
-      const sizeAttr = particleGeometry.getAttribute("aSize") as THREE.BufferAttribute;
-      const alphaAttr = particleGeometry.getAttribute("aAlpha") as THREE.BufferAttribute;
-
-      const activeEdges = activeEdgesRef.current;
-      const hasActiveEdges = activeEdges.length > 0;
-
-      for (let i = 0; i < maxParticles; i++) {
-        const p = particles[i];
-
-        if (hasActiveEdges) {
-          // Stable edge assignment: only (re)pick when invalid or the path
-          // changed. Previously this re-rolled every frame AND on loop, which
-          // made particles teleport erratically between edges.
-          if (p.edgeIndex < 0 || p.edgeIndex >= activeEdges.length) {
-            p.edgeIndex = Math.floor(Math.random() * activeEdges.length);
-          }
-
-          const edge = activeEdges[p.edgeIndex];
-          const from = edge.from;
-          const to = edge.to;
-          const mid = edge.mid;
-
-          // Always advance so the flow reads as "building toward the selected
-          // concept" (prereq -> topic). The old code froze particles whenever a
-          // topic was selected — exactly when flow should be visible.
-          p.t += p.speed;
-          if (p.t >= 1.0) {
-            p.t = 0.0;
-            // Pick a fresh edge only on loop completion, not every frame.
-            p.edgeIndex = Math.floor(Math.random() * activeEdges.length);
-          }
-
-          // Position along the quadratic bezier B(t), matching the curve the
-          // active edges are drawn with so particles ride the visible trail.
-          const t = p.t;
-          const u = 1 - t;
-          const x = u * u * from.x + 2 * u * t * mid.x + t * t * to.x;
-          const y = u * u * from.y + 2 * u * t * mid.y + t * t * to.y;
-          const z = u * u * from.z + 2 * u * t * mid.z + t * t * to.z;
-
-          // Tangent of the bezier at t (derivative) for the swirl frame.
-          const dx = 2 * u * (mid.x - from.x) + 2 * t * (to.x - mid.x);
-          const dy = 2 * u * (mid.y - from.y) + 2 * t * (to.y - mid.y);
-          const dz = 2 * u * (mid.z - from.z) + 2 * t * (to.z - mid.z);
-          const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1.0;
-
-          let px = -dy;
-          let py = dx;
-          let pz = 0;
-          if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
-            px = 1;
-            py = 0;
-            pz = 0;
-          }
-          const plen = Math.sqrt(px * px + py * py + pz * pz) || 1.0;
-          px /= plen; py /= plen; pz /= plen;
-
-          const qx = (dy * pz - dz * py) / len;
-          const qy = (dz * px - dx * pz) / len;
-          const qz = (dx * py - dy * px) / len;
-
-          const currentAngle = p.offsetAngle + p.t * Math.PI * 3.0;
-          const cosA = Math.cos(currentAngle) * p.offsetRadius;
-          const sinA = Math.sin(currentAngle) * p.offsetRadius;
-
-          const finalX = x + (px * cosA + qx * sinA);
-          const finalY = y + (py * cosA + qy * sinA);
-          const finalZ = z + (pz * cosA + qz * sinA);
-
-          posAttr.setXYZ(i, finalX, finalY, finalZ);
-          colorAttr.setXYZ(i, edge.color.r, edge.color.g, edge.color.b);
-
-          const pulsedSize = p.size * (1.0 + 0.2 * Math.sin(performance.now() * 0.004 + i));
-          sizeAttr.setX(i, pulsedSize);
-
-          // Smooth fade-in/out at the path ends to prevent popping.
-          let alpha = 1.0;
-          if (p.t < 0.18) {
-            alpha = p.t / 0.18;
-          } else if (p.t > 0.82) {
-            alpha = (1.0 - p.t) / 0.18;
-          }
-          alphaAttr.setX(i, alpha * 0.8);
-        } else {
-          posAttr.setXYZ(i, 0, 0, 0);
-          colorAttr.setXYZ(i, 0, 0, 0);
-          sizeAttr.setX(i, 0);
-          alphaAttr.setX(i, 0);
-        }
-      }
-
-      posAttr.needsUpdate = true;
-      colorAttr.needsUpdate = true;
-      sizeAttr.needsUpdate = true;
-      alphaAttr.needsUpdate = true;
-
-
-
-      // renderer.render(scene, camera); // Redundant if using composer
       renderer.render(scene, camera);
       animationFrameId = requestAnimationFrame(render);
     };
@@ -1336,15 +1153,11 @@ export default function ThreeDGraphCanvas({
     const handleResize = () => {
       const parentRect = containerRef.current?.getBoundingClientRect();
       if (parentRect) {
-        const dpr = window.devicePixelRatio || 1;
-        canvas.width = parentRect.width * dpr;
-        canvas.height = parentRect.height * dpr;
-        canvas.style.width = `${parentRect.width}px`;
-        canvas.style.height = `${parentRect.height}px`;
-
         renderer.setSize(parentRect.width, parentRect.height, false);
         camera.aspect = parentRect.width / parentRect.height;
         camera.updateProjectionMatrix();
+        activeHardMaterial.resolution.set(parentRect.width, parentRect.height);
+        activeSoftMaterial.resolution.set(parentRect.width, parentRect.height);
       }
     };
 
@@ -1354,30 +1167,165 @@ export default function ThreeDGraphCanvas({
       resizeObserver.observe(containerRef.current);
     }
 
-    // Native non-passive wheel listener so preventDefault actually works.
-    // React attaches onWheel passively, which made the old handler's
-    // preventDefault a no-op and let the page scroll/zoom under the canvas.
-    const handleNativeWheel = (e: WheelEvent) => {
-      e.preventDefault();
+    // --- Unified pointer listeners (selection coexists with OrbitControls) ---
+    let pointerCount = 0;
+    let multiTouch = false;
+    let pointerDownPos = { x: 0, y: 0 };
+    let pointerDownTime = 0;
+    let pointerDownType = "";
+    let pointerMovedDistSq = 0;
+
+    const onPointerDown = (e: PointerEvent) => {
+      pointerCount++;
+      if (pointerCount === 1) {
+        pointerActiveRef.current = true;
+        multiTouch = false;
+        pointerMovedDistSq = 0;
+        pointerDownPos = { x: e.clientX, y: e.clientY };
+        pointerDownTime = Date.now();
+        pointerDownType = e.pointerType;
+        mousePosRef.current = null;
+        framingAnimRef.current.active = false;
+        canvas.style.cursor = "grabbing";
+      } else {
+        multiTouch = true;
+      }
       lastInteractionTime.current = Date.now();
-      const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-      targetZoom.current = Math.max(0.6, Math.min(6.5, zoom.current * zoomFactor));
     };
-    canvas.addEventListener("wheel", handleNativeWheel, { passive: false });
+
+    const onPointerMove = (e: PointerEvent) => {
+      lastInteractionTime.current = Date.now();
+      if (!pointerActiveRef.current) {
+        const rect = canvas.getBoundingClientRect();
+        mousePosRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        return;
+      }
+      const dx = e.clientX - pointerDownPos.x;
+      const dy = e.clientY - pointerDownPos.y;
+      pointerMovedDistSq = dx * dx + dy * dy;
+      if (pointerDownType === "touch" && pointerMovedDistSq >= 225 &&
+          touchPinnedTopicRef.current) {
+        setTouchPinnedTopic(null);
+      }
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      pointerCount = Math.max(0, pointerCount - 1);
+      if (pointerCount > 0) return;
+      if (!pointerActiveRef.current) return;
+      pointerActiveRef.current = false;
+      lastInteractionTime.current = Date.now();
+      canvas.style.cursor = "grab";
+
+      if (multiTouch) return;
+      if (pointerMovedDistSq >= CLICK_THRESHOLD_SQ) return;
+      const isTouch = pointerDownType === "touch";
+      if (isTouch && Date.now() - pointerDownTime >= TAP_MAX_DURATION_MS) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const radiusSq = isTouch ? TAP_RADIUS_SQ_TOUCH : TAP_RADIUS_SQ_DESKTOP;
+
+      let closestNode: typeof projectedCoordsRef.current[0] | null = null;
+      let minDistSq = radiusSq;
+      let bestDepth = Infinity;
+      for (const node of projectedCoordsRef.current) {
+        if (!node.visible) continue;
+        const dx = x - node.sx;
+        const dy = y - node.sy;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < minDistSq && node.zDepth < bestDepth) {
+          minDistSq = distSq;
+          bestDepth = node.zDepth;
+          closestNode = node;
+        }
+      }
+
+      if (closestNode) {
+        // Single-click selects a node, or switches to a different one.
+        // Clicking the already-active node is a no-op on desktop so the
+        // double-click handler owns deselection (a single click would otherwise
+        // steal the node before the dblclick lands). Touch keeps the legacy
+        // tap-to-toggle because dblclick is unreliable on touch surfaces.
+        const isActive = activeTopicRef.current?.id === closestNode.topic.id;
+        if (isActive && !isTouch) {
+          // no-op — double-click deselects
+        } else {
+          onSelectTopicRef.current(closestNode.topic);
+          if (isTouch) setTouchPinnedTopic(closestNode.topic);
+        }
+      } else {
+        onDeselectRef.current?.();
+        if (isTouch) setTouchPinnedTopic(null);
+      }
+    };
+
+    const onPointerLeave = () => {
+      mousePosRef.current = null;
+      hoverDwellRef.current = { id: null, since: 0 };
+      // Reset the dwell-skip so re-entering the canvas pays the initial
+      // dwell once more (prevents an instant pop on re-entry).
+      tooltipOpenedRef.current = false;
+      setHoveredTopic(null);
+      canvas.style.cursor = "grab";
+    };
+
+    // Double-click resets the overview framing. If it lands on the active
+    // node, preserve the existing deselect gesture before returning to the
+    // default 3/4 camera. Touch surfaces do not emit dblclick reliably, so
+    // touch keeps tap-to-toggle in the pointer handler above.
+    const onDoubleClick = (e: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      let closestNode: typeof projectedCoordsRef.current[0] | null = null;
+      let minDistSq = TAP_RADIUS_SQ_DESKTOP;
+      let bestDepth = Infinity;
+      for (const node of projectedCoordsRef.current) {
+        if (!node.visible) continue;
+        const dx = x - node.sx;
+        const dy = y - node.sy;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < minDistSq && node.zDepth < bestDepth) {
+          minDistSq = distSq;
+          bestDepth = node.zDepth;
+          closestNode = node;
+        }
+      }
+
+      if (closestNode && activeTopicRef.current?.id === closestNode.topic.id) {
+        onDeselectRef.current?.();
+      }
+      handleResetView();
+    };
+
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointerleave", onPointerLeave);
+    canvas.addEventListener("dblclick", onDoubleClick);
+    canvas.style.cursor = "grab";
 
     render();
+    setSceneReady(true);
 
     // Clean up WebGL resources thoroughly to prevent GPU memory leaks
     return () => {
       cancelAnimationFrame(animationFrameId);
       resizeObserver.disconnect();
-      canvas.removeEventListener("wheel", handleNativeWheel);
+
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointerleave", onPointerLeave);
+      canvas.removeEventListener("dblclick", onDoubleClick);
+
+      controls.dispose();
 
       pointsGeometry.dispose();
       pointsMaterial.dispose();
-
-      particleGeometry.dispose();
-      particleMaterial.dispose();
 
       hardEdgesGeometry.dispose();
       hardEdgesMaterial.dispose();
@@ -1391,267 +1339,41 @@ export default function ThreeDGraphCanvas({
       activeSoftGeometry.dispose();
       activeSoftMaterial.dispose();
 
-      spineGeometry.dispose();
-      spineMaterial.dispose();
-      spineCoreMaterial.dispose();
-
-      for (const ring of ringsData) {
-        ring.geometry.dispose();
-        ring.material.dispose();
-      }
-
-      haloGeometry.dispose();
-      haloMaterial.dispose();
-
+      innerRingGeo.dispose();
+      innerRingMat.dispose();
       renderer.dispose();
+      sceneRef.current = null;
     };
   }, []);
 
-  // Handle Mouse Events for Camera control (orbit, pan, select)
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    isDragging.current = true;
-    pressActive.current = true;
-    pressMovedDistSq.current = 0;
-    dragStart.current = { x: e.clientX, y: e.clientY };
-    lastInteractionTime.current = Date.now();
-    mousePosRef.current = null; // Suppress hover logic during drag start
-    if (canvasRef.current) canvasRef.current.style.cursor = "grabbing";
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    lastInteractionTime.current = Date.now();
-
-    const currentRect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - currentRect.left;
-    const mouseY = e.clientY - currentRect.top;
-
-    if (isDragging.current) {
-      const dx = e.clientX - dragStart.current.x;
-      const dy = e.clientY - dragStart.current.y;
-
-      // Accumulate total movement since press so we can tell a click from a drag.
-      pressMovedDistSq.current += dx * dx + dy * dy;
-
-      if (e.shiftKey) {
-        // Shift + Drag to Pan camera
-        targetPan.current = {
-          x: pan.current.x + dx * 0.45,
-          y: pan.current.y + dy * 0.45
-        };
-      } else {
-        // Standard Drag to Orbit camera
-        targetRotation.current.y = rotation.current.y + dx * 0.007;
-        targetRotation.current.x = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, rotation.current.x - dy * 0.007));
-      }
-
-      dragStart.current = { x: e.clientX, y: e.clientY };
-    } else {
-      // Store hover coordinates for vsync-synchronized render-loop raycasting
-      mousePosRef.current = { x: mouseX, y: mouseY };
-    }
-  };
-
-  const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    isDragging.current = false;
-    if (canvasRef.current) canvasRef.current.style.cursor = "default";
-
-    // Treat as a click only if the pointer barely moved during the press.
-    // This stops a finished orbit/pan from accidentally selecting a node.
-    const CLICK_THRESHOLD_SQ = 6 * 6; // ~6px of total movement allowed
-    const wasClick = pressActive.current && pressMovedDistSq.current < CLICK_THRESHOLD_SQ;
-    pressActive.current = false;
-
-    if (!wasClick) return;
-
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const currentRect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - currentRect.left;
-    const mouseY = e.clientY - currentRect.top;
-
-    let closestNode: typeof projectedCoordsRef.current[0] | null = null;
-    let minDistanceSq = 16 * 16; // 16px desktop tap target radius squared
-    let bestDepth = Infinity;
-
-    for (const node of projectedCoordsRef.current) {
-      const dx = mouseX - node.sx;
-      const dy = mouseY - node.sy;
-      const distSq = dx * dx + dy * dy;
-
-      if (distSq < minDistanceSq) {
-        if (node.zDepth < bestDepth) {
-          bestDepth = node.zDepth;
-          closestNode = node;
-        }
-      }
-    }
-
-    if (closestNode) {
-      onSelectTopic(closestNode.topic);
-    } else {
-      // Click on empty space clears the selection.
-      onDeselectRef.current?.();
-    }
-  };
-
-  // --- MOBILE / TOUCH ACCESS EVENT HANDLERS ---
-  const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    lastInteractionTime.current = Date.now();
-    if (e.touches.length === 1) {
-      isDragging.current = true;
-      const touch = e.touches[0];
-      dragStart.current = { x: touch.clientX, y: touch.clientY };
-      touchStartTimeRef.current = Date.now();
-      touchStartPosRef.current = { x: touch.clientX, y: touch.clientY };
-    } else if (e.touches.length === 2) {
-      isDragging.current = false; // Disable single finger drag during dual finger pinch
-      const touch1 = e.touches[0];
-      const touch2 = e.touches[1];
-      pinchStartDistRef.current = Math.hypot(touch2.clientX - touch1.clientX, touch2.clientY - touch1.clientY);
-      zoomStartValRef.current = zoom.current;
-    }
-  };
-
-  const handleTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    lastInteractionTime.current = Date.now();
-
-    if (e.touches.length === 1 && isDragging.current) {
-      const touch = e.touches[0];
-      const dx = touch.clientX - dragStart.current.x;
-      const dy = touch.clientY - dragStart.current.y;
-
-      // Panning clears the touch-pinned preview card: a drag is no longer a
-      // "look at this node" gesture, so the card shouldn't linger on the old one.
-      const movedFromStart = Math.hypot(touch.clientX - touchStartPosRef.current.x, touch.clientY - touchStartPosRef.current.y);
-      if (movedFromStart >= 15 && touchPinnedTopicRef.current !== null) {
-        setTouchPinnedTopic(null);
-      }
-
-      targetRotation.current.y = rotation.current.y + dx * 0.009;
-      targetRotation.current.x = Math.max(
-        -Math.PI / 2 + 0.1,
-        Math.min(Math.PI / 2 - 0.1, rotation.current.x - dy * 0.009)
-      );
-
-      dragStart.current = { x: touch.clientX, y: touch.clientY };
-    } else if (e.touches.length === 2) {
-      const touch1 = e.touches[0];
-      const touch2 = e.touches[1];
-      const dist = Math.hypot(touch2.clientX - touch1.clientX, touch2.clientY - touch1.clientY);
-      if (pinchStartDistRef.current > 0) {
-        const factor = dist / pinchStartDistRef.current;
-        targetZoom.current = Math.max(0.6, Math.min(6.5, zoomStartValRef.current * factor));
-      }
-    }
-  };
-
-  const handleTouchEnd = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    isDragging.current = false;
-    pinchStartDistRef.current = 0;
-
-    // Detect micro-tap event (highly responsive tap duration window)
-    const duration = Date.now() - touchStartTimeRef.current;
-    if (duration < 350 && e.changedTouches.length === 1) {
-      const touch = e.changedTouches[0];
-      const dx = touch.clientX - touchStartPosRef.current.x;
-      const dy = touch.clientY - touchStartPosRef.current.y;
-      const distMoved = Math.hypot(dx, dy);
-
-      // Verify that user's finger remained relatively still
-      if (distMoved < 15) {
-        const currentRect = canvas.getBoundingClientRect();
-        const touchX = touch.clientX - currentRect.left;
-        const touchY = touch.clientY - currentRect.top;
-
-        // Mobile target selection: generous 40px radius (1600 px^2 squared) for easy mobile tapping
-        let closestNode: typeof projectedCoordsRef.current[0] | null = null;
-        let minDistanceSq = 40 * 40; 
-        let bestDepth = Infinity;
-
-        for (const node of projectedCoordsRef.current) {
-          const ndx = touchX - node.sx;
-          const ndy = touchY - node.sy;
-          const distSq = ndx * ndx + ndy * ndy;
-
-          if (distSq < minDistanceSq) {
-            if (node.zDepth < bestDepth) {
-              bestDepth = node.zDepth;
-              closestNode = node;
-            }
-          }
-        }
-
-        if (closestNode) {
-          onSelectTopic(closestNode.topic);
-          // Pin the preview card to the tapped node. It persists until the next
-          // pan, empty-tap, or deselect (see handleTouchMove / handleTouchEnd /
-          // the activeTopic effect) — replacing the old fixed 1500ms flash,
-          // which was too short to read and redundant with the sidebar.
-          setTouchPinnedTopic(closestNode.topic);
-        } else {
-          // Tap on empty space clears the selection and the pinned card.
-          setTouchPinnedTopic(null);
-          onDeselectRef.current?.();
-        }
-      }
-    }
-  };
-
-  // Reset camera framing to the default overview. Called by the on-canvas
-  // "reset view" button; also notifies the parent (e.g. to stop auto-rotate).
+  // Reset camera framing to the default overview.
   const handleResetView = () => {
-    targetRotation.current = { x: -0.3, y: 0.6 };
-    targetZoom.current = 1.85;
-    targetPan.current = { x: 0, y: 0 };
+    framingAnimRef.current = {
+      active: true,
+      targetPos: new THREE.Vector3(0, 0, 0),
+      targetCamPos: new THREE.Vector3(
+        DEFAULT_CAMERA_POSITION.x,
+        DEFAULT_CAMERA_POSITION.y,
+        DEFAULT_CAMERA_POSITION.z,
+      ),
+      targetDist: DEFAULT_CAMERA_DISTANCE,
+    };
     lastInteractionTime.current = Date.now();
     onResetView();
   };
 
   return (
-    <div 
-      ref={containerRef} 
-      className="w-full h-full relative overflow-hidden flex items-center justify-center select-none bg-[#090b11]"
+    <div
+      ref={containerRef}
+      className="w-full h-full relative overflow-hidden flex items-center justify-center select-none bg-[#0b0e14]"
     >
       <canvas
         ref={canvasRef}
         role="img"
-        aria-label="Interactive 3D graph of 1,590 learning concepts. Each dot is a skill colored by subject; vertical position maps to age (4 at bottom to 15 at top). Drag to rotate, scroll to zoom, and click a dot to inspect it. A full, keyboard-navigable catalog and pathway view is available in the sidebar."
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        onMouseLeave={() => {
-          isDragging.current = false;
-          pressActive.current = false;
-          mousePosRef.current = null;
-          hoverDwellRef.current = { id: null, since: 0 };
-          if (canvasRef.current) canvasRef.current.style.cursor = "default";
-          setHoveredTopic(null);
-        }}
+        aria-label="Interactive 3D map of 1,590 learning concepts. Each dot is a skill colored by subject. Vertical position shows age progression — age 4 at the bottom to age 15 at the top. Drag to orbit, scroll to zoom, and click a node to see its prerequisites. Click a selected node again to deselect. A full catalog and pathway view is in the sidebar."
         className="block touch-none"
+        style={{ cursor: "grab" }}
       />
-
-      {/* High-DPI, GPU-synchronized absolute positioned HUD Labels.
-          aria-hidden: these are decorative duplicates of information already
-          available in the screen-reader-accessible sidebar. */}
-      <div ref={labelBottomRef} aria-hidden="true" className="absolute left-0 top-0 pointer-events-none text-[8.5px] font-mono text-pink-400/80 uppercase select-none leading-none tracking-wider" style={{ display: "none" }} />
-      <div ref={labelMiddleRef} aria-hidden="true" className="absolute left-0 top-0 pointer-events-none text-[8.5px] font-mono text-purple-400/80 uppercase select-none leading-none tracking-wider" style={{ display: "none" }} />
-      <div ref={labelTopRef} aria-hidden="true" className="absolute left-0 top-0 pointer-events-none text-[8.5px] font-mono text-cyan-400/80 uppercase select-none leading-none tracking-wider" style={{ display: "none" }} />
-
-      {/* Smart node-label layer (populated imperatively from the label pool).
-          aria-hidden: decorative on-canvas labels; the sidebar is the a11y path. */}
-      <div ref={labelLayerRef} aria-hidden="true" className="absolute inset-0 pointer-events-none z-30 select-none" />
 
       {/* Top-right on-canvas controls: auto-rotate toggle + reset view. */}
       <div className="absolute top-3 right-3 z-40 flex gap-1.5">
@@ -1660,10 +1382,10 @@ export default function ThreeDGraphCanvas({
           title={autoRotate ? "Pause auto-rotate" : "Play auto-rotate"}
           aria-label={autoRotate ? "Pause auto-rotate" : "Play auto-rotate"}
           aria-pressed={autoRotate}
-          className={`pointer-events-auto flex items-center justify-center w-9 h-9 rounded-lg border backdrop-blur-md transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#090b11] ${
+          className={`pointer-events-auto flex items-center justify-center w-10 h-10 rounded-lg border backdrop-blur-md transition-[colors,transform] duration-150 ease-out active:scale-95 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#0b0e14] ${
             autoRotate
-              ? "bg-indigo-500/20 border-indigo-400/40 text-indigo-200 hover:bg-indigo-500/30"
-              : "bg-[#070b19]/70 border-white/10 text-slate-300 hover:text-white hover:border-white/20"
+              ? "bg-blue-500/15 border-blue-400/30 text-blue-200 hover:bg-blue-500/25"
+              : "bg-[#0b0e14]/70 border-white/10 text-slate-300 hover:text-white hover:border-white/20"
           }`}
         >
           {autoRotate ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
@@ -1672,52 +1394,35 @@ export default function ThreeDGraphCanvas({
           onClick={handleResetView}
           title="Reset view"
           aria-label="Reset view"
-          className="pointer-events-auto flex items-center justify-center w-9 h-9 rounded-lg border bg-[#070b19]/70 border-white/10 text-slate-300 hover:text-white hover:border-white/20 backdrop-blur-md transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#090b11]"
+          className="pointer-events-auto flex items-center justify-center w-10 h-10 rounded-lg border bg-[#0b0e14]/70 border-white/10 text-slate-300 hover:text-white hover:border-white/20 backdrop-blur-md transition-[colors,transform] duration-150 ease-out active:scale-95 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-1 focus-visible:ring-offset-[#0b0e14]"
         >
           <LocateFixed className="w-4 h-4" />
         </button>
       </div>
 
-      {/* Hover / tap detail card.
-          Always mounted to avoid a first-frame flash at (0,0); opacity and
-          position are toggled imperatively from the render loop. Content
-          (domain, age, title, description) is written imperatively each frame
-          so the latest hovered or touch-pinned node's data shows without React
-          re-renders.
-          aria-hidden: the canvas aria-label is a generic graph description
-          (not node-specific), so this transient sighted-only preview is
-          intentionally hidden from AT. Keyboard and screen-reader users
-          browse nodes via the sidebar catalog, which is the accessible path. */}
+      {/* Minimalist serif hover / tap detail card.
+          Ultra-thin border, semi-transparent dark background, a single
+          colored subject dot, serif title, muted mono meta + description.
+          Always mounted to avoid a first-frame flash; opacity/position
+          toggled imperatively from the render loop. */}
       <div
         ref={tooltipRef}
         aria-hidden="true"
-        className="absolute pointer-events-none z-50 select-none transition-opacity duration-150"
-        style={{ transform: "translate(-50%, -100%)", left: 0, top: 0, opacity: 0, minWidth: "180px", width: "max-content", maxWidth: "260px" }}
+        className="absolute pointer-events-none z-50 select-none"
+        style={{ transform: "translate(-50%, -100%)", left: 0, top: 0, opacity: 0, minWidth: "200px", width: "max-content", maxWidth: "280px" }}
       >
-        <div className="rounded-lg overflow-hidden shadow-[0_8px_32px_rgba(0,0,0,0.85)] bg-slate-950/95 border border-white/10">
-          {/* Age (lead) + domain, with the subject color bar as the sole hue signal. */}
-          <div className="flex items-center gap-2 px-3 py-2 border-b border-white/10">
-            <span ref={tooltipBarRef} className="w-1 h-8 rounded-full shrink-0" style={{ backgroundColor: "#94a3b8" }} />
-            <div className="flex flex-col leading-tight overflow-hidden">
-              <span ref={tooltipAgeRef} className="text-[11px] font-bold text-slate-200 tracking-wide tabular-nums">
-                AGE 4–6
-              </span>
-              <span ref={tooltipDomainRef} className="text-[10px] font-medium uppercase tracking-wide text-slate-400 truncate">
-                DOMAIN
-              </span>
-            </div>
+        <div className="rounded-md overflow-hidden border border-white/10 bg-[#0b0e14]/85 backdrop-blur-sm px-3 py-2.5">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span ref={tooltipDotRef} className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: "#94a3b8" }} />
+            <span ref={tooltipMetaRef} className="text-[9px] font-mono uppercase tracking-wider text-slate-500 truncate">
+              SUBJECT · AGE 4–6
+            </span>
           </div>
-          {/* Title (row 2) */}
-          <div ref={tooltipTitleRef} className="font-sans font-bold text-[13px] text-white leading-snug px-3 pt-2.5">
+          <div ref={tooltipTitleRef} className="text-[15px] text-slate-100 leading-snug" style={{ fontFamily: "var(--font-serif)", fontWeight: 400 }}>
             Title
           </div>
-          {/* Short description (row 3) — line-clamp-2 is the single truncation layer. */}
-          <div ref={tooltipDescRef} className="font-sans text-[10.5px] text-slate-300 leading-relaxed px-3 pb-2 pt-1 line-clamp-2">
+          <div ref={tooltipDescRef} className="text-[10px] text-slate-400 leading-relaxed mt-1 line-clamp-2">
             Description
-          </div>
-          {/* Affordance: signals that selecting opens the full inspector (sidebar Inspect tab). */}
-          <div className="px-3 py-1.5 border-t border-white/5 text-[9px] text-slate-500 tracking-wide">
-            Inspect →
           </div>
         </div>
       </div>

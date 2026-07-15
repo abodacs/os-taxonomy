@@ -42,17 +42,7 @@ function Explorer() {
   } = useExplorer();
 
   return (
-    <div className="min-h-screen bg-[#03060f] text-slate-100 flex flex-col font-sans relative overflow-hidden">
-      {/* Background ambient radial glowing spots for visual luxury */}
-      <div
-        className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full bg-indigo-900/10 blur-[150px] pointer-events-none"
-        aria-hidden="true"
-      />
-      <div
-        className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-emerald-900/10 blur-[150px] pointer-events-none"
-        aria-hidden="true"
-      />
-
+    <div className="min-h-screen bg-[#0b0e14] text-slate-100 flex flex-col font-sans relative overflow-hidden">
       {/* Skip link for keyboard users */}
       <a
         href="#main-content"
@@ -61,11 +51,12 @@ function Explorer() {
         Skip to content
       </a>
 
-      {/* Main Grid: Left area for immersive 3D graph + overlays, Right area for the HUD Sidebar */}
-      <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 relative">
+      {/* The specimen owns the full viewport. The inspector is an overlay so
+          opening it never changes the graph's camera framing or composition. */}
+      <div className="flex-1 relative min-h-screen">
         <main
           id="main-content"
-          className="lg:col-span-8 h-[60vh] lg:h-screen relative flex flex-col justify-between p-4 md:p-6 border-b lg:border-b-0 lg:border-r border-white/5"
+          className="w-full h-[72vh] min-h-[620px] lg:h-screen relative flex flex-col justify-between p-4 md:p-6"
         >
           {/* Top-Left Overlay Panel */}
           <BrandOverlay />
@@ -90,7 +81,7 @@ function Explorer() {
           </div>
         </main>
 
-        {/* Right Side: Premium HUD Sidebar Inspector */}
+        {/* Right Side: floating HUD inspector */}
         <Sidebar>
           <Sidebar.Tabs />
           <Sidebar.Body>
