@@ -3,9 +3,6 @@
 // diffable without scrolling through 1800 lines of component logic.
 
 export const POINTS_VERTEX_SHADER = `
-  uniform float uZoom;
-  uniform float uScale;
-
   attribute float aSize;
   attribute vec3 aColor;
   attribute float aAlpha;
@@ -24,7 +21,9 @@ export const POINTS_VERTEX_SHADER = `
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     float dist = length(mvPosition.xyz);
 
-    float size = aSize * (450.0 / dist) * uZoom * uScale;
+    // Perspective-scaled sprites keep the specimen readable without turning
+    // every node into the same screen-space circle.
+    float size = aSize * (640.0 / max(dist, 1.0));
 
     if (aSize > 0.0 && aAlpha > 0.01) {
       // Small emphasis nudge for the selected node only.
@@ -32,10 +31,7 @@ export const POINTS_VERTEX_SHADER = `
         size *= 1.15;
       }
 
-      // Keep nodes visible when zoomed out.
-      if (size < 5.0) {
-        size = 5.0;
-      }
+      size = clamp(size, 3.0, 20.0);
     } else {
       size = 0.0;
     }
@@ -47,8 +43,6 @@ export const POINTS_VERTEX_SHADER = `
 `;
 
 export const POINTS_FRAGMENT_SHADER = `
-  uniform float uTime;
-  uniform float uReducedMotion;
   varying vec3 vColor;
   varying float vAlpha;
   varying float vSelected;
@@ -62,10 +56,8 @@ export const POINTS_FRAGMENT_SHADER = `
       discard;
     }
 
-    // Solid, opaque dot: a ~1px anti-aliased edge with a flat full-opacity
-    // interior. NormalBlending + opaque fill gives the crisp filled-disc
-    // aesthetic (matches the reference), replacing the old additive glow.
-    float alpha = smoothstep(1.0, 0.92, r2);
+    // Crisp circular sprite with a restrained antialiased edge.
+    float alpha = smoothstep(1.0, 0.84, r2);
 
     // Flat solid fill — no glow core, no halo. Selection is conveyed by the
     // double-ring outline + size lift, not by shader brightness.

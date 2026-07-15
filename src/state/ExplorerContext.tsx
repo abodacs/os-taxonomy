@@ -8,7 +8,6 @@ import {
 import { Topic } from "../types";
 import {
   topicsList,
-  topicsMap,
   curriculaList,
 } from "../dataLoader";
 import { SUBJECT_COLORS, subjectColor as subjectColorUtil } from "../theme/subjectColors";
@@ -109,17 +108,10 @@ type Standard = Curriculum["topics"][number];
 
 const ExplorerContext = createContext<ExplorerContextValue | null>(null);
 
-const DEFAULT_TOPIC_ID = "mt_N8CpN1EJrP"; // "Building sentences"
-
 export function ExplorerProvider({ children }: { children: ReactNode }) {
-  const defaultTopic = useMemo(
-    () => topicsMap.get(DEFAULT_TOPIC_ID) || topicsList[0],
-    []
-  );
-
-  const [activeTopic, setActiveTopic] = useState<Topic | null>(
-    defaultTopic || null
-  );
+  // Start on the complete taxonomy. A topic becomes active only after an
+  // explicit click, tap, or selection from the catalog/sidebar.
+  const [activeTopic, setActiveTopic] = useState<Topic | null>(null);
   // The subject currently isolated in the graph (or null = all subjects shown).
   // `hiddenSubjects` is derived from this in the value memo below so the 3D
   // canvas contract (which consumes `hiddenSubjects`) stays unchanged.

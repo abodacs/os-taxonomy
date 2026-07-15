@@ -1,4 +1,5 @@
 import { useExplorer } from "../../state/ExplorerContext";
+import { SUBJECT_COLORS } from "../../theme/subjectColors";
 
 /**
  * Bottom-left overlay: the subject legend. Each subject is a toggle button
@@ -14,11 +15,16 @@ export function SubjectLegend() {
     derived: { subjectStats },
   } = useExplorer();
 
+  const statsBySubject = new Map(subjectStats.map((subject) => [subject.name, subject]));
+  const orderedStats = Object.keys(SUBJECT_COLORS)
+    .map((name) => statsBySubject.get(name))
+    .filter((subject): subject is (typeof subjectStats)[number] => Boolean(subject));
+
   return (
-    <div className="bg-[#0b0e14]/70 backdrop-blur-md border border-white/8 rounded-xl p-4 max-w-sm w-full">
-      <div className="flex items-center justify-between mb-2.5 border-b border-white/5 pb-1.5">
+    <div className="bg-[#0b0e14]/82 border border-white/10 rounded-2xl p-4 md:w-[476px] max-w-full">
+      <div className="flex items-center justify-between mb-2.5">
         <span className="text-[10px] font-mono text-slate-400 tracking-wider uppercase">
-          Subjects
+          Subjects · click to toggle
         </span>
         <span className="text-[10px] font-mono text-slate-500">
           {isolatedSubject ? "isolated" : `${subjectStats.length}`}
@@ -26,7 +32,7 @@ export function SubjectLegend() {
       </div>
 
       <div className="grid grid-cols-2 gap-1.5 text-xs">
-        {subjectStats.map((sub) => {
+        {orderedStats.map((sub) => {
           const isSoloed = isolatedSubject === sub.name;
           return (
             <button
@@ -38,10 +44,10 @@ export function SubjectLegend() {
                   ? "Currently isolated. Click to show all subjects."
                   : "Click to isolate this subject."
               }`}
-              className={`flex items-center justify-between px-2 py-1.5 rounded-md border text-left transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
+              className={`flex items-center justify-between px-2 py-1 rounded-md text-left transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
                 isSoloed
-                  ? "bg-white/[0.06] border-white/25"
-                  : "bg-white/[0.03] border-white/8 opacity-70 hover:opacity-100 hover:border-white/15"
+                  ? "bg-white/[0.07]"
+                  : "opacity-75 hover:bg-white/[0.04] hover:opacity-100"
               }`}
             >
               <div className="flex items-center gap-1.5 truncate">
@@ -51,7 +57,7 @@ export function SubjectLegend() {
                     backgroundColor: sub.color,
                     // Dim the dot for non-isolated subjects so the isolated
                     // one reads as the active selection against a quiet field.
-                    opacity: isSoloed ? 1 : 0.5,
+                    opacity: isSoloed || !isolatedSubject ? 1 : 0.5,
                   }}
                 />
                 <span
