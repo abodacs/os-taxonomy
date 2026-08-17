@@ -1,12 +1,10 @@
-import { Topic, Dependency, Curriculum, Cluster, TaxonomyManifest } from "./types";
+import { Topic, Dependency, Curriculum, Cluster } from "./types";
 import topicsData from "../data/topics.json";
 import dependenciesData from "../data/dependencies.json";
 import standardsData from "../data/curriculum-standards.json";
 import clustersData from "../data/clusters.json";
-import manifestData from "../data/manifest.json";
 
 // Typed data structures
-export const manifest = manifestData as TaxonomyManifest;
 export const topicsList = (topicsData as any).topics as Topic[];
 export const dependenciesList = (dependenciesData as any).dependencies as Dependency[];
 export const clustersList = (clustersData as any).clusters as Cluster[];
@@ -18,8 +16,6 @@ export const topicsMap = new Map<string, Topic>(topicsList.map(t => [t.id, t]));
 // Adjacency lists for DAG traversal
 // topicId -> array of prerequisites
 export const prereqAdjacencyList = new Map<string, Dependency[]>();
-// prerequisiteId -> array of topic dependencies (what it unlocks)
-export const unlockAdjacencyList = new Map<string, Dependency[]>();
 
 // Initialize adjacency lists
 for (const dep of dependenciesList) {
@@ -28,12 +24,6 @@ for (const dep of dependenciesList) {
     prereqAdjacencyList.set(dep.topicId, []);
   }
   prereqAdjacencyList.get(dep.topicId)!.push(dep);
-
-  // Unlock lookups
-  if (!unlockAdjacencyList.has(dep.prerequisiteId)) {
-    unlockAdjacencyList.set(dep.prerequisiteId, []);
-  }
-  unlockAdjacencyList.get(dep.prerequisiteId)!.push(dep);
 }
 
 // Internal: DFS traversal over an adjacency list. Shared by the two transitive
@@ -68,13 +58,6 @@ function traverseTransitive(
 // Returns list of unique topic IDs in topological order (bottom-up: prerequisites first)
 export function getTransitivePrerequisites(id: string): { topic: Topic; distance: number }[] {
   return traverseTransitive(id, prereqAdjacencyList, dep => dep.prerequisiteId);
-}
-
-// Helper: Compute transitive sequels (everything this topic unlocks)
-// Returns list of unique topic IDs that depend on the start topic, directly
-// or transitively, with their graph distance from the start node.
-export function getTransitiveSequels(id: string): { topic: Topic; distance: number }[] {
-  return traverseTransitive(id, unlockAdjacencyList, dep => dep.topicId);
 }
 
 // Helper: Get cluster summary for a topic

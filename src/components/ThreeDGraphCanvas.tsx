@@ -68,16 +68,70 @@ function damp(current: number, target: number, k60: number, dt: number): number 
 
 // prefers-reduced-motion: checked once at setup. Auto-rotate and the two
 // oscillating pulses (selection ring + shader selPulse) are gated on this;
-// size/opacity transitions are kept because they aid comprehension, which is
-// the reduced-motion best practice (fewer/gentler, not zero).
+// node size/opacity/color state lands instantly rather than easing (the
+// state itself carries the information — motion is not needed to read it).
 const prefersReducedMotion =
   typeof window !== "undefined" &&
   window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+// Node size modular scale — the single documented system for node sizing,
+// replacing the former ad-hoc multipliers (1.7 / 1.25 / 1.2 / 0.82 / 1.3 /
+// 1.15). Built on a perfect fourth (4:3), the same calibrated-interval
+// discipline as the UI's type and spacing: each state sits exactly one step
+// from its neighbor, so the hierarchy primary > branch > terminal >
+// unrelated survives the squint test and holds at every zoom level.
+//   unrelated  3:4  = 0.75     silent field while a topic is selected
+//   field      1:1  = 1        default specimen (and terminal nodes)
+//   branch     4:3  ≈ 1.333    prerequisite path
+//   primary   16:9  ≈ 1.778    selected node
+//   hover      ×4:3            one-step lift; preview only
+const NODE_SIZE_SCALE = {
+  unrelated: 3 / 4,
+  field: 1,
+  branch: 4 / 3,
+  primary: 16 / 9,
+  hover: 4 / 3,
+} as const;
+
+// Unrelated-node color: 55% of the subject color, pre-converted from sRGB to
+// the linear working space the shader encodes back from, so the silent field
+// keeps its calibrated faintness now that sprite output is sRGB-corrected.
+const UNRELATED_COLOR_SCALE = 0.2637; // sRGB 0.55 → linear
 
 // State colors as plain RGB float triples for fast per-node lerp.
 const RGB_PRIMARY = new THREE.Color(STATE_COLORS.primary);
 const RGB_BRANCH = new THREE.Color(STATE_COLORS.branch);
 const RGB_TERMINAL = new THREE.Color(STATE_COLORS.terminal);
+
+// Module-scope camera defaults. Allocated once, cloned per framing animation
+// start — keeps THREE.Vector3 construction out of the React render path.
+const DEFAULT_TARGET_POS = new THREE.Vector3(0, 0, 0);
+const DEFAULT_CAM_POS = new THREE.Vector3(
+  DEFAULT_CAMERA_POSITION.x,
+  DEFAULT_CAMERA_POSITION.y,
+  DEFAULT_CAMERA_POSITION.z,
+);
+
+interface FramingAnim {
+  active: boolean;
+  targetPos: THREE.Vector3;
+  targetCamPos: THREE.Vector3;
+  targetDist: number;
+}
+
+// Role color of an active edge (prerequisite -> topic), both endpoints inside
+// the selected related sub-DAG. Returns shared read-only constants — callers
+// must not mutate the returned Color.
+function edgeRoleColor(
+  prereqId: string,
+  topicId: string,
+  selId: string,
+  terminalIds: Set<string>
+): THREE.Color {
+  if (topicId === selId) return RGB_PRIMARY; // primary focus path into selected
+  if (terminalIds.has(prereqId) || terminalIds.has(topicId)) return RGB_TERMINAL;
+  return RGB_BRANCH;
+}
 
 // Pure placement decision for the tooltip card: prefer above the anchor node,
 // flip below if it would clip the top edge and there's room beneath, and clamp
@@ -125,14 +179,18 @@ export default function ThreeDGraphCanvas({
   const controlsRef = useRef<OrbitControls | null>(null);
   const pointerActiveRef = useRef(false);
   const onSelectTopicRef = useRef(onSelectTopic);
-  const framingAnimRef = useRef<{
-    active: boolean;
-    targetPos: THREE.Vector3;
-    targetCamPos: THREE.Vector3;
-    targetDist: number;
-  }>({ active: false, targetPos: new THREE.Vector3(0, 0, 0), targetCamPos: new THREE.Vector3(DEFAULT_CAMERA_POSITION.x, DEFAULT_CAMERA_POSITION.y, DEFAULT_CAMERA_POSITION.z), targetDist: DEFAULT_CAMERA_DISTANCE });
+  // The useState lazy initializer runs exactly once, so the THREE.Vector3s are
+  // allocated a single time — no per-render allocation, no ref mutation
+  // during render. Exposed through a ref for the render loop.
+  const [framingAnim] = useState<FramingAnim>(() => ({
+    active: false,
+    targetPos: DEFAULT_TARGET_POS.clone(),
+    targetCamPos: DEFAULT_CAM_POS.clone(),
+    targetDist: DEFAULT_CAMERA_DISTANCE,
+  }));
+  const framingAnimRef = useRef(framingAnim);
 
-  const lastInteractionTime = useRef(Date.now());
+  const lastInteractionTime = useRef(0);
 
   // Hover-intent dwell: record the candidate node + the timestamp it first
   // became a candidate, and only commit the hover after a short dwell. This
@@ -150,6 +208,22 @@ export default function ThreeDGraphCanvas({
   // Touch-pinned topic: the node a mobile tap selected. Unlike hover, this
   // persists until the next pan, empty-tap, or deselect.
   const [touchPinnedTopic, setTouchPinnedTopic] = useState<Topic | null>(null);
+
+  // Upper bounds for the edge buffers, allocated once at setup. Replacing
+  // BufferAttributes on every filter/selection change leaks GPU buffers (the
+  // renderer only frees them at geometry.dispose — attribute dispose events
+  // go unheard), and replacing instanced line buffers also clamps later,
+  // larger paths to the first render's cached _maxInstanceCount. So every
+  // edge geometry keeps max-size arrays and draws a prefix via
+  // drawRange/instanceCount instead.
+  const edgeCapacity = useMemo(() => {
+    let hard = 0;
+    let soft = 0;
+    for (const dep of dependenciesList) {
+      if (dep.strength === "soft") soft++; else hard++;
+    }
+    return { hard, soft };
+  }, []);
 
   // Calculate connection counts for centrality
   const nodeCentrality = useMemo(() => {
@@ -310,27 +384,26 @@ export default function ThreeDGraphCanvas({
     visible: true,
   })), [nodes]);
   const projectedCoordsRef = useRef(projectedCoords);
+  // O(1) id -> projected-entry lookup for the hover/tap card. Entries are the
+  // same mutable objects as projectedCoords, so lookups stay current without
+  // re-scanning all 1,590 nodes each frame.
+  const projectedByTopicId = useMemo(
+    () => new Map(projectedCoords.map(p => [p.topic.id, p] as const)),
+    [projectedCoords]
+  );
+  const projectedByTopicIdRef = useRef(projectedByTopicId);
 
   // WebGL stable object references for updates and cleanups
   const pointsGeometryRef = useRef<THREE.BufferGeometry | null>(null);
   const pointsMaterialRef = useRef<THREE.ShaderMaterial | null>(null);
   const hardEdgesGeometryRef = useRef<THREE.BufferGeometry | null>(null);
   const softEdgesGeometryRef = useRef<THREE.BufferGeometry | null>(null);
-  const backgroundSoftLinesRef = useRef<THREE.LineSegments | null>(null);
   const activeHardGeometryRef = useRef<LineSegmentsGeometry | null>(null);
   const activeSoftGeometryRef = useRef<LineSegmentsGeometry | null>(null);
-  const activeSoftLinesRef = useRef<LineSegments2 | null>(null);
   const activeHardMaterialRef = useRef<LineMaterial | null>(null);
   const activeSoftMaterialRef = useRef<LineMaterial | null>(null);
   const hardEdgesMaterialRef = useRef<THREE.LineBasicMaterial | null>(null);
   const softEdgesMaterialRef = useRef<THREE.LineDashedMaterial | null>(null);
-  const activeEdgesRef = useRef<Array<{
-    from: { x: number; y: number; z: number };
-    to: { x: number; y: number; z: number };
-    mid: { x: number; y: number; z: number };
-    color: THREE.Color;
-    subject: string;
-  }>>([]);
 
   // Refs for core Three.js objects
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -349,8 +422,19 @@ export default function ThreeDGraphCanvas({
   // Animated state refs for smooth transitions
   const animatedSizesRef = useRef<Float32Array | null>(null);
   const animatedAlphasRef = useRef<Float32Array | null>(null);
-  const animatedSelectedRef = useRef<Float32Array | null>(null);
   const animatedColorsRef = useRef<Float32Array | null>(null);
+  // True while a size/alpha/color transition is still converging.
+  // The render loop only runs the full-node damping pass (and re-uploads the
+  // three GPU attribute buffers) while this is set; state-change kicks re-arm
+  // it, and it clears once every animated value has reached its target.
+  const attributesDirtyRef = useRef(true);
+  // True when the projected screen coordinates are stale relative to the
+  // camera (camera moved / pointer went down) and must be recomputed on the
+  // next frame even when nothing is hovering.
+  const projectionDirtyRef = useRef(true);
+  // Cached canvas bounding rect (page never scrolls; refreshed on resize).
+  // Avoids a forced getBoundingClientRect on every pointermove event.
+  const canvasRectRef = useRef<{ left: number; top: number } | null>(null);
 
   // Sync reactive properties into refs for render loop access without re-instantiation
   const activeTopicRef = useRef(activeTopic);
@@ -379,8 +463,9 @@ export default function ThreeDGraphCanvas({
     onDeselectRef.current = onDeselectTopic;
     nodeByTopicIdRef.current = nodeByTopicId;
     projectedCoordsRef.current = projectedCoords;
+    projectedByTopicIdRef.current = projectedByTopicId;
     onSelectTopicRef.current = onSelectTopic;
-  }, [activeTopic, hoveredTopic, touchPinnedTopic, hiddenSubjects, nodes, selectionGraph, autoRotate, onDeselectTopic, nodeByTopicId, onSelectTopic, projectedCoords]);
+  }, [activeTopic, hoveredTopic, touchPinnedTopic, hiddenSubjects, nodes, selectionGraph, autoRotate, onDeselectTopic, nodeByTopicId, onSelectTopic, projectedCoords, projectedByTopicId]);
 
   // Clear the touch-pinned card whenever the selection is cleared by any path
   useEffect(() => {
@@ -390,9 +475,10 @@ export default function ThreeDGraphCanvas({
   // Precompute per-node subject colors as THREE.Color for the color lerp.
   const colorCache = useMemo(() => nodes.map(node => new THREE.Color(node.color)), [nodes]);
 
-  // High-performance CPU update for size/alpha/color/selected attributes,
+  // High-performance CPU update for size/alpha/color attributes,
   // transitioning values smoothly. Colors lerp between the subject color
-  // (default) and the state-based diverging palette (on selection).
+  // (default) and the state-based diverging palette (on selection). Sizes
+  // come from the NODE_SIZE_SCALE modular scale.
   // `dt` is seconds since the last frame for frame-rate-independent damping;
   // when omitted (e.g. the one-shot useEffect kick on state change) a single
   // 60fps step is used, which is plenty for a kick.
@@ -402,7 +488,6 @@ export default function ThreeDGraphCanvas({
 
     const sizes = geometry.attributes.aSize.array as Float32Array;
     const alphas = geometry.attributes.aAlpha.array as Float32Array;
-    const selectedAttr = geometry.attributes.aSelected.array as Float32Array;
     const colorAttr = geometry.attributes.aColor.array as Float32Array;
 
     const currentActiveTopic = activeTopicRef.current;
@@ -416,25 +501,33 @@ export default function ThreeDGraphCanvas({
     if (!animatedSizesRef.current || animatedSizesRef.current.length !== currentNodes.length) {
       animatedSizesRef.current = new Float32Array(currentNodes.length);
       animatedAlphasRef.current = new Float32Array(currentNodes.length);
-      animatedSelectedRef.current = new Float32Array(currentNodes.length);
       animatedColorsRef.current = new Float32Array(currentNodes.length * 3);
       forceImmediate = true;
     }
 
     const animatedSizes = animatedSizesRef.current;
     const animatedAlphas = animatedAlphasRef.current;
-    const animatedSelected = animatedSelectedRef.current;
     const animatedColors = animatedColorsRef.current;
-    if (!animatedSizes || !animatedAlphas || !animatedSelected || !animatedColors) return;
+    if (!animatedSizes || !animatedAlphas || !animatedColors) return;
+
+    // Reduced motion: land state changes instantly. The ease is decoration;
+    // the size/color state itself carries the information.
+    if (prefersReducedMotion) forceImmediate = true;
 
     const selId = currentActiveTopic?.id;
+    // Largest per-channel delta this pass. Once every animated value is within
+    // EPSILON of its target the transition has converged: snap to the targets,
+    // clear the dirty flag, and the render loop stops calling this function
+    // (and stops re-uploading the three attribute buffers) until the next
+    // state change re-arms it.
+    let maxDelta = 0;
+    const EPSILON = 0.0015;
 
     currentNodes.forEach((node, i) => {
       const isHidden = currentHiddenSubjects.has(node.topic.subject);
 
-      let targetSize = node.baseRadius * 1.0;
+      let targetSize = node.baseRadius * NODE_SIZE_SCALE.field;
       let targetAlpha = 0.9; // Reference uses readable solid subject dots
-      let targetSelected = 0.0;
       // Default color: the node's muted subject color.
       let tr = colorCache[i].r;
       let tg = colorCache[i].g;
@@ -443,7 +536,6 @@ export default function ThreeDGraphCanvas({
       if (isHidden) {
         targetSize = 0.0;
         targetAlpha = 0.0;
-        targetSelected = 0.0;
       } else {
         if (isTopicSelected) {
           const isSelected = selId === node.topic.id;
@@ -451,39 +543,36 @@ export default function ThreeDGraphCanvas({
           const isRelated = currentSelection.relatedIds.has(node.topic.id);
 
           if (isSelected) {
-            targetSize = node.baseRadius * 1.7;
+            targetSize = node.baseRadius * NODE_SIZE_SCALE.primary;
             targetAlpha = 1.0;
-            targetSelected = 1.0;
             tr = RGB_PRIMARY.r; tg = RGB_PRIMARY.g; tb = RGB_PRIMARY.b;
           } else if (isTerminal) {
-            targetSize = node.baseRadius * 1.25;
+            targetSize = node.baseRadius * NODE_SIZE_SCALE.field;
             targetAlpha = 1.0;
-            targetSelected = 5.0;
             tr = RGB_TERMINAL.r; tg = RGB_TERMINAL.g; tb = RGB_TERMINAL.b;
           } else if (isRelated) {
-            targetSize = node.baseRadius * 1.2;
+            targetSize = node.baseRadius * NODE_SIZE_SCALE.branch;
             targetAlpha = 1.0;
-            targetSelected = 2.0;
             tr = RGB_BRANCH.r; tg = RGB_BRANCH.g; tb = RGB_BRANCH.b;
           } else {
-            // Unrelated: near-invisible per spec §7. The selected sub-DAG
-            // (primary white / branch blue / terminal rose, all at full
-            // opacity) pops against a near-empty field; the faint residual
+            // Unrelated: visually silent per spec §7 — one modular step down
+            // in size plus a perceptual ~55% subject color. The selected
+            // sub-DAG (primary white / branch blue / terminal rose, all at
+            // full opacity) pops against the quiet field; the faint residual
             // keeps just enough of the surrounding web for spatial reference.
-            targetSize = node.baseRadius * 0.82;
+            targetSize = node.baseRadius * NODE_SIZE_SCALE.unrelated;
             targetAlpha = 0.42;
-            targetSelected = 3.0;
-            tr = colorCache[i].r * 0.55;
-            tg = colorCache[i].g * 0.55;
-            tb = colorCache[i].b * 0.55;
+            tr = colorCache[i].r * UNRELATED_COLOR_SCALE;
+            tg = colorCache[i].g * UNRELATED_COLOR_SCALE;
+            tb = colorCache[i].b * UNRELATED_COLOR_SCALE;
           }
         }
 
-        // Hover preview: show the subject color at a lifted opacity + bigger,
+        // Hover preview: lift one modular step and restore the subject color,
         // regardless of selection state. Hover is a preview; click reveals the
         // full prerequisite + sequel path.
         if (currentHoveredTopic && node.topic.id === currentHoveredTopic.id) {
-          targetSize *= 1.3;
+          targetSize *= NODE_SIZE_SCALE.hover;
           targetAlpha = Math.max(targetAlpha, 0.7);
           tr = colorCache[i].r;
           tg = colorCache[i].g;
@@ -494,170 +583,215 @@ export default function ThreeDGraphCanvas({
       if (forceImmediate) {
         animatedSizes[i] = targetSize;
         animatedAlphas[i] = targetAlpha;
-        animatedSelected[i] = targetSelected;
         animatedColors[i * 3] = tr;
         animatedColors[i * 3 + 1] = tg;
         animatedColors[i * 3 + 2] = tb;
       } else {
-        // Frame-rate-independent damping (0.2 @ 60fps reference). Keeps node
-        // size/opacity/color transitions at the same wall-clock speed on any
-        // display refresh rate.
+        // Frame-rate-independent exponential ease-out (0.2 @ 60fps
+        // reference). Monotonic by construction — it can never overshoot,
+        // flicker, or pop — and keeps transitions at the same wall-clock
+        // speed on any display refresh rate.
         const k = 1 - Math.pow(1 - 0.2, (dt ?? 1 / 60) * 60);
         animatedSizes[i] += (targetSize - animatedSizes[i]) * k;
         animatedAlphas[i] += (targetAlpha - animatedAlphas[i]) * k;
-        animatedSelected[i] += (targetSelected - animatedSelected[i]) * k;
         animatedColors[i * 3] += (tr - animatedColors[i * 3]) * k;
         animatedColors[i * 3 + 1] += (tg - animatedColors[i * 3 + 1]) * k;
         animatedColors[i * 3 + 2] += (tb - animatedColors[i * 3 + 2]) * k;
+        const dSize = Math.abs(targetSize - animatedSizes[i]);
+        const dAlpha = Math.abs(targetAlpha - animatedAlphas[i]);
+        const dR = Math.abs(tr - animatedColors[i * 3]);
+        const dG = Math.abs(tg - animatedColors[i * 3 + 1]);
+        const dB = Math.abs(tb - animatedColors[i * 3 + 2]);
+        const nodeMax = Math.max(dSize, dAlpha, dR, dG, dB);
+        if (nodeMax > maxDelta) maxDelta = nodeMax;
       }
 
       sizes[i] = animatedSizes[i];
       alphas[i] = animatedAlphas[i];
-      selectedAttr[i] = animatedSelected[i];
       colorAttr[i * 3] = animatedColors[i * 3];
       colorAttr[i * 3 + 1] = animatedColors[i * 3 + 1];
       colorAttr[i * 3 + 2] = animatedColors[i * 3 + 2];
     });
 
+    if (forceImmediate || maxDelta < EPSILON) {
+      // Converged: every animated value is either exactly on target
+      // (forceImmediate) or within EPSILON (0.0015) of it — below
+      // perceptibility — so stop re-running this pass and re-uploading the
+      // attribute buffers until the next state-change kick.
+      attributesDirtyRef.current = false;
+    }
+
     geometry.attributes.aSize.needsUpdate = true;
     geometry.attributes.aAlpha.needsUpdate = true;
-    geometry.attributes.aSelected.needsUpdate = true;
     geometry.attributes.aColor.needsUpdate = true;
   };
 
   useEffect(() => {
+    // Re-arm the convergence flag (the render loop stops updating node
+    // attributes once a transition settles) and take one damped step
+    // immediately so state changes read as instant, not next-frame.
+    attributesDirtyRef.current = true;
     updateNodeAttributes();
   }, [nodes, activeTopic, hoveredTopic, hiddenSubjects, selectionGraph]);
 
-  // Update background connections when subject visibility filters change
+  // Update background connections when subject visibility filters change.
+  // Fills the preallocated max-size arrays in place (see edgeCapacity) and
+  // narrows drawRange — no attribute replacement, no GPU-buffer leak.
   useEffect(() => {
     const hardGeometry = hardEdgesGeometryRef.current;
     const softGeometry = softEdgesGeometryRef.current;
     if (!hardGeometry || !softGeometry) return;
 
-    const hardPositions: number[] = [];
-    const softPositions: number[] = [];
+    const hardPositions = hardGeometry.attributes.position.array as Float32Array;
+    const softPositions = softGeometry.attributes.position.array as Float32Array;
+    const softDistances = softGeometry.attributes.lineDistance.array as Float32Array;
+
+    let hardCount = 0;
+    let softCount = 0;
 
     for (const dep of dependenciesList) {
       const fromNode = activeNodesMap.get(dep.prerequisiteId);
       const toNode = activeNodesMap.get(dep.topicId);
-      if (fromNode && toNode) {
-        if (dep.strength === "soft") {
-          softPositions.push(fromNode.x, fromNode.y, fromNode.z);
-          softPositions.push(toNode.x, toNode.y, toNode.z);
-        } else {
-          hardPositions.push(fromNode.x, fromNode.y, fromNode.z);
-          hardPositions.push(toNode.x, toNode.y, toNode.z);
-        }
+      if (!fromNode || !toNode) continue;
+
+      if (dep.strength === "soft") {
+        // Dashed lines need per-vertex cumulative distances (replicates
+        // LineSegments.computeLineDistances for the visible prefix).
+        const o = softCount * 6;
+        softPositions[o] = fromNode.x;
+        softPositions[o + 1] = fromNode.y;
+        softPositions[o + 2] = fromNode.z;
+        softPositions[o + 3] = toNode.x;
+        softPositions[o + 4] = toNode.y;
+        softPositions[o + 5] = toNode.z;
+        const d0 = softCount === 0 ? 0 : softDistances[softCount * 2 - 1];
+        const len = Math.hypot(
+          toNode.x - fromNode.x,
+          toNode.y - fromNode.y,
+          toNode.z - fromNode.z
+        );
+        softDistances[softCount * 2] = d0;
+        softDistances[softCount * 2 + 1] = d0 + len;
+        softCount++;
+      } else {
+        const o = hardCount * 6;
+        hardPositions[o] = fromNode.x;
+        hardPositions[o + 1] = fromNode.y;
+        hardPositions[o + 2] = fromNode.z;
+        hardPositions[o + 3] = toNode.x;
+        hardPositions[o + 4] = toNode.y;
+        hardPositions[o + 5] = toNode.z;
+        hardCount++;
       }
     }
 
-    hardGeometry.setAttribute("position", new THREE.Float32BufferAttribute(hardPositions, 3));
-    softGeometry.setAttribute("position", new THREE.Float32BufferAttribute(softPositions, 3));
-    if (backgroundSoftLinesRef.current) {
-      backgroundSoftLinesRef.current.computeLineDistances();
-    }
+    (hardGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (softGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (softGeometry.attributes.lineDistance as THREE.BufferAttribute).needsUpdate = true;
+    hardGeometry.setDrawRange(0, hardCount * 2);
+    softGeometry.setDrawRange(0, softCount * 2);
   }, [activeNodesMap, sceneReady]);
-
-  // Determine the role color of an active edge (prereq -> topic), both of which
-  // are in the selected related sub-DAG.
-  const edgeRoleColor = (
-    prereqId: string,
-    topicId: string,
-    selId: string,
-    terminalIds: Set<string>
-  ): THREE.Color => {
-    if (topicId === selId) return RGB_PRIMARY.clone(); // primary focus path into selected
-    if (terminalIds.has(prereqId) || terminalIds.has(topicId)) return RGB_TERMINAL.clone();
-    return RGB_BRANCH.clone();
-  };
 
   // Update active prerequisite + sequel path lines when selected topic changes.
   // Active edges are bowed quadratic-bezier polylines (sampled into short
   // segments) so the trail reads as a connected, separable path. Each edge is
-  // colored by its role (white / blue / rose) via per-vertex colors.
+  // colored by its role (white / blue / rose) via per-vertex colors. Fills the
+  // preallocated instanced buffers in place (see edgeCapacity) and adjusts
+  // instanceCount — replacing buffers per selection would leak GPU memory and
+  // clamp later paths to the first selection's cached _maxInstanceCount.
   const CURVE_SEGMENTS = 12;
   useEffect(() => {
     const hardGeometry = activeHardGeometryRef.current;
     const softGeometry = activeSoftGeometryRef.current;
-    const hardMaterial = activeHardMaterialRef.current;
-    const softMaterial = activeSoftMaterialRef.current;
-    if (!hardGeometry || !softGeometry || !hardMaterial || !softMaterial) return;
+    if (!hardGeometry || !softGeometry) return;
 
-    const hardPositions: number[] = [];
-    const hardColors: number[] = [];
-    const softPositions: number[] = [];
-    const softColors: number[] = [];
-    const activeEdgesList: Array<{
-      from: { x: number; y: number; z: number };
-      to: { x: number; y: number; z: number };
-      mid: { x: number; y: number; z: number };
-      color: THREE.Color;
-      subject: string;
-    }> = [];
+    // The instance attributes of LineSegmentsGeometry are interleaved; each
+    // wraps one shared InstancedInterleavedBuffer per kind (position, color,
+    // distance) whose backing array we fill in place.
+    const hardPositions = (hardGeometry.attributes.instanceStart as THREE.InterleavedBufferAttribute).data.array as Float32Array;
+    const hardColors = (hardGeometry.attributes.instanceColorStart as THREE.InterleavedBufferAttribute).data.array as Float32Array;
+    const softPositions = (softGeometry.attributes.instanceStart as THREE.InterleavedBufferAttribute).data.array as Float32Array;
+    const softColors = (softGeometry.attributes.instanceColorStart as THREE.InterleavedBufferAttribute).data.array as Float32Array;
+    const softDistances = (softGeometry.attributes.instanceDistanceStart as THREE.InterleavedBufferAttribute).data.array as Float32Array;
+
+    let hardSeg = 0;
+    let softSeg = 0;
+    let softDistTotal = 0;
 
     if (activeTopic) {
       const selId = activeTopic.id;
       const { relatedIds, terminalIds } = selectionGraph;
       for (const dep of dependenciesList) {
         const isRelatedPath = relatedIds.has(dep.topicId) && relatedIds.has(dep.prerequisiteId);
-        if (isRelatedPath) {
-          const fromNode = activeNodesMap.get(dep.prerequisiteId);
-          const toNode = activeNodesMap.get(dep.topicId);
-          if (fromNode && toNode) {
-            const fx = fromNode.x, fy = fromNode.y, fz = fromNode.z;
-            const tx = toNode.x, ty = toNode.y, tz = toNode.z;
+        if (!isRelatedPath) continue;
+        const fromNode = activeNodesMap.get(dep.prerequisiteId);
+        const toNode = activeNodesMap.get(dep.topicId);
+        if (!fromNode || !toNode) continue;
 
-            const mx = (fx + tx) / 2;
-            const my = (fy + ty) / 2;
-            const mz = (fz + tz) / 2;
-            const radialLen = Math.hypot(mx, mz) || 1;
-            const edgeLen = Math.hypot(tx - fx, ty - fy, tz - fz);
-            const bow = Math.min(14, edgeLen * 0.18);
-            const midX = mx + (mx / radialLen) * bow;
-            const midY = my;
-            const midZ = mz + (mz / radialLen) * bow;
+        const fx = fromNode.x, fy = fromNode.y, fz = fromNode.z;
+        const tx = toNode.x, ty = toNode.y, tz = toNode.z;
 
-            const roleColor = edgeRoleColor(dep.prerequisiteId, dep.topicId, selId, terminalIds);
-            activeEdgesList.push({
-              from: { x: fx, y: fy, z: fz },
-              to: { x: tx, y: ty, z: tz },
-              mid: { x: midX, y: midY, z: midZ },
-              color: roleColor,
-              subject: fromNode.topic.subject
-            });
+        const mx = (fx + tx) / 2;
+        const my = (fy + ty) / 2;
+        const mz = (fz + tz) / 2;
+        const radialLen = Math.hypot(mx, mz) || 1;
+        const edgeLen = Math.hypot(tx - fx, ty - fy, tz - fz);
+        const bow = Math.min(14, edgeLen * 0.18);
+        const midX = mx + (mx / radialLen) * bow;
+        const midY = my;
+        const midZ = mz + (mz / radialLen) * bow;
 
-            let px = fx, py = fy, pz = fz;
-            const targetPos = dep.strength === "soft" ? softPositions : hardPositions;
-            const targetCol = dep.strength === "soft" ? softColors : hardColors;
-            for (let s = 1; s <= CURVE_SEGMENTS; s++) {
-              const t = s / CURVE_SEGMENTS;
-              const u = 1 - t;
-              const cx = u * u * fx + 2 * u * t * midX + t * t * tx;
-              const cy = u * u * fy + 2 * u * t * midY + t * t * ty;
-              const cz = u * u * fz + 2 * u * t * midZ + t * t * tz;
-              targetPos.push(px, py, pz, cx, cy, cz);
-              // Per-vertex color (both endpoints of the segment share the edge role color).
-              targetCol.push(roleColor.r, roleColor.g, roleColor.b, roleColor.r, roleColor.g, roleColor.b);
-              px = cx; py = cy; pz = cz;
-            }
+        const roleColor = edgeRoleColor(dep.prerequisiteId, dep.topicId, selId, terminalIds);
+        const isSoft = dep.strength === "soft";
+
+        let px = fx, py = fy, pz = fz;
+        for (let s = 1; s <= CURVE_SEGMENTS; s++) {
+          const t = s / CURVE_SEGMENTS;
+          const u = 1 - t;
+          const cx = u * u * fx + 2 * u * t * midX + t * t * tx;
+          const cy = u * u * fy + 2 * u * t * midY + t * t * ty;
+          const cz = u * u * fz + 2 * u * t * midZ + t * t * tz;
+
+          const seg = isSoft ? softSeg : hardSeg;
+          const o = seg * 6;
+          const positions = isSoft ? softPositions : hardPositions;
+          const colors = isSoft ? softColors : hardColors;
+          positions[o] = px;
+          positions[o + 1] = py;
+          positions[o + 2] = pz;
+          positions[o + 3] = cx;
+          positions[o + 4] = cy;
+          positions[o + 5] = cz;
+          // Per-vertex color (both endpoints of the segment share the edge role color).
+          colors[o] = roleColor.r;
+          colors[o + 1] = roleColor.g;
+          colors[o + 2] = roleColor.b;
+          colors[o + 3] = roleColor.r;
+          colors[o + 4] = roleColor.g;
+          colors[o + 5] = roleColor.b;
+          if (isSoft) {
+            // Cumulative dashed distances (replicates
+            // LineSegments2.computeLineDistances for the used prefix).
+            const len = Math.hypot(cx - px, cy - py, cz - pz);
+            softDistances[seg * 2] = softDistTotal;
+            softDistTotal += len;
+            softDistances[seg * 2 + 1] = softDistTotal;
+            softSeg++;
+          } else {
+            hardSeg++;
           }
+          px = cx; py = cy; pz = cz;
         }
       }
-
-      // Material color is white so vertex colors pass through unchanged.
-      hardMaterial.color.set(0xffffff);
-      softMaterial.color.set(0xffffff);
     }
 
-    activeEdgesRef.current = activeEdgesList;
-    hardGeometry.setPositions(hardPositions);
-    hardGeometry.setColors(hardColors);
-    softGeometry.setPositions(softPositions);
-    softGeometry.setColors(softColors);
-    if (activeSoftLinesRef.current) {
-      activeSoftLinesRef.current.computeLineDistances();
-    }
+    (hardGeometry.attributes.instanceStart as THREE.InterleavedBufferAttribute).data.needsUpdate = true;
+    (hardGeometry.attributes.instanceColorStart as THREE.InterleavedBufferAttribute).data.needsUpdate = true;
+    (softGeometry.attributes.instanceStart as THREE.InterleavedBufferAttribute).data.needsUpdate = true;
+    (softGeometry.attributes.instanceColorStart as THREE.InterleavedBufferAttribute).data.needsUpdate = true;
+    (softGeometry.attributes.instanceDistanceStart as THREE.InterleavedBufferAttribute).data.needsUpdate = true;
+    hardGeometry.instanceCount = hardSeg;
+    softGeometry.instanceCount = softSeg;
   }, [activeTopic, selectionGraph, activeNodesMap, sceneReady]);
 
   // Smoothly frame the camera on the selected node via the framing animation
@@ -697,12 +831,8 @@ export default function ThreeDGraphCanvas({
     } else {
       framingAnimRef.current = {
         active: true,
-        targetPos: new THREE.Vector3(0, 0, 0),
-        targetCamPos: new THREE.Vector3(
-          DEFAULT_CAMERA_POSITION.x,
-          DEFAULT_CAMERA_POSITION.y,
-          DEFAULT_CAMERA_POSITION.z,
-        ),
+        targetPos: DEFAULT_TARGET_POS.clone(),
+        targetCamPos: DEFAULT_CAM_POS.clone(),
         targetDist: DEFAULT_CAMERA_DISTANCE,
       };
     }
@@ -771,9 +901,34 @@ export default function ThreeDGraphCanvas({
     controls.update();
     controlsRef.current = controls;
 
+    // Any camera move (user orbit/zoom or auto-rotate) makes the cached
+    // screen-space projections stale; the render loop re-projects on the next
+    // frame only when something actually consumes them.
+    const onControlsChange = () => {
+      projectionDirtyRef.current = true;
+    };
+    controls.addEventListener("change", onControlsChange);
+
     // --- 3. BACKGROUND CONNECTIONS (ultra-faint spiderweb) ---
     const hardEdgesGeometry = new THREE.BufferGeometry();
     const softEdgesGeometry = new THREE.BufferGeometry();
+    // Max-size attributes allocated once (see edgeCapacity). Filter changes
+    // fill a prefix and narrow drawRange; the attributes themselves are never
+    // replaced, so no GPU buffers leak.
+    hardEdgesGeometry.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array(edgeCapacity.hard * 6), 3)
+    );
+    softEdgesGeometry.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array(edgeCapacity.soft * 6), 3)
+    );
+    softEdgesGeometry.setAttribute(
+      "lineDistance",
+      new THREE.BufferAttribute(new Float32Array(edgeCapacity.soft * 2), 1)
+    );
+    hardEdgesGeometry.setDrawRange(0, 0);
+    softEdgesGeometry.setDrawRange(0, 0);
 
     const hardEdgesMaterial = new THREE.LineBasicMaterial({
       color: 0x334155,
@@ -800,13 +955,37 @@ export default function ThreeDGraphCanvas({
 
     hardEdgesGeometryRef.current = hardEdgesGeometry;
     softEdgesGeometryRef.current = softEdgesGeometry;
-    backgroundSoftLinesRef.current = backgroundSoftLines;
     hardEdgesMaterialRef.current = hardEdgesMaterial;
     softEdgesMaterialRef.current = softEdgesMaterial;
 
     // --- 4. ACTIVE CONNECTIONS (role-colored prerequisite + sequel paths) ---
     const activeHardGeometry = new LineSegmentsGeometry();
     const activeSoftGeometry = new LineSegmentsGeometry();
+    // Initialize max-size instanced buffers once (see edgeCapacity). Selections
+    // write into these arrays in place and set instanceCount — never replaced,
+    // so no GPU-buffer leak and no _maxInstanceCount clamp on later, larger
+    // prerequisite paths.
+    const activeHardMaxSegs = edgeCapacity.hard * CURVE_SEGMENTS;
+    const activeSoftMaxSegs = edgeCapacity.soft * CURVE_SEGMENTS;
+    activeHardGeometry.setPositions(new Float32Array(activeHardMaxSegs * 6));
+    activeHardGeometry.setColors(new Float32Array(activeHardMaxSegs * 6));
+    activeSoftGeometry.setPositions(new Float32Array(activeSoftMaxSegs * 6));
+    activeSoftGeometry.setColors(new Float32Array(activeSoftMaxSegs * 6));
+    // Dashed soft paths need cumulative per-instance distances. Allocated once
+    // here instead of per-selection computeLineDistances() calls.
+    const softDistanceBuffer = new THREE.InstancedInterleavedBuffer(
+      new Float32Array(activeSoftMaxSegs * 2), 2, 1
+    );
+    activeSoftGeometry.setAttribute(
+      "instanceDistanceStart",
+      new THREE.InterleavedBufferAttribute(softDistanceBuffer, 1, 0)
+    );
+    activeSoftGeometry.setAttribute(
+      "instanceDistanceEnd",
+      new THREE.InterleavedBufferAttribute(softDistanceBuffer, 1, 1)
+    );
+    activeHardGeometry.instanceCount = 0;
+    activeSoftGeometry.instanceCount = 0;
 
     const activeHardMaterial = new LineMaterial({
       color: 0xffffff,
@@ -842,12 +1021,16 @@ export default function ThreeDGraphCanvas({
     const activeSoftLines = new LineSegments2(activeSoftGeometry, activeSoftMaterial);
     activeHardLines.renderOrder = 4;
     activeSoftLines.renderOrder = 4;
+    // The preallocated buffers are mostly unfilled, so a lazily computed
+    // bounding sphere would be wrong (and stale across selections). These are
+    // depth-test-off overlay paths — skip frustum culling for them.
+    activeHardLines.frustumCulled = false;
+    activeSoftLines.frustumCulled = false;
     graphGroup.add(activeHardLines);
     graphGroup.add(activeSoftLines);
 
     activeHardGeometryRef.current = activeHardGeometry;
     activeSoftGeometryRef.current = activeSoftGeometry;
-    activeSoftLinesRef.current = activeSoftLines;
     activeHardMaterialRef.current = activeHardMaterial;
     activeSoftMaterialRef.current = activeSoftMaterial;
 
@@ -857,7 +1040,6 @@ export default function ThreeDGraphCanvas({
     const colors = new Float32Array(nodes.length * 3);
     const sizes = new Float32Array(nodes.length);
     const alphas = new Float32Array(nodes.length);
-    const selectedAttr = new Float32Array(nodes.length);
 
     nodes.forEach((node, i) => {
       positions[i * 3] = node.x;
@@ -869,13 +1051,20 @@ export default function ThreeDGraphCanvas({
     pointsGeometry.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
     pointsGeometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
     pointsGeometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
-    pointsGeometry.setAttribute("aSelected", new THREE.BufferAttribute(selectedAttr, 1));
 
     pointsGeometryRef.current = pointsGeometry;
+    // Guarantee the fresh geometry gets its first attribute pass even if a
+    // pre-setup kick already converged against stale animation state.
+    attributesDirtyRef.current = true;
 
     const pointsMaterial = new THREE.ShaderMaterial({
       vertexShader: POINTS_VERTEX_SHADER,
       fragmentShader: POINTS_FRAGMENT_SHADER,
+      uniforms: {
+        // Sprite sizes are authored in CSS px; the shader scales them to
+        // framebuffer pixels so discs render identically at 1x/2x DPR.
+        uPixelRatio: { value: renderer.getPixelRatio() },
+      },
       transparent: true,
       // Points must participate in the depth buffer. Without depth writes,
       // overlapping sprites are composited in submission order and the graph
@@ -964,11 +1153,15 @@ export default function ThreeDGraphCanvas({
 
       controls.update();
 
-      // graphGroup stays at identity — no rotation/position to set.
-      graphGroup.updateMatrixWorld(true);
+      // graphGroup stays at identity for the scene's lifetime (the camera
+      // orbits; nothing in the group transforms), so node local coordinates
+      // are world coordinates and no per-frame matrix-world update is needed.
 
-      // Update node attributes dynamically
-      updateNodeAttributes(false, dt);
+      // Update node attributes dynamically — only while a size/alpha/color
+      // transition is still converging (see attributesDirtyRef).
+      if (attributesDirtyRef.current) {
+        updateNodeAttributes(false, dt);
+      }
 
       // Project all coordinates to screen-space for hover tracking and HTML HUD positioning.
       const cssW = canvas.clientWidth || canvas.width / (window.devicePixelRatio || 1);
@@ -996,18 +1189,27 @@ export default function ThreeDGraphCanvas({
 
       const projectedCoords = projectedCoordsRef.current;
       const currentNodes = nodesRef.current;
-      for (let i = 0; i < currentNodes.length; i++) {
-        const node = currentNodes[i];
-        const projected = projectedCoords[i];
-        projected.visible = !hiddenSubjectsRef.current.has(node.topic.subject);
-        if (!projected.visible) continue;
+      // Project only while something consumes screen-space coordinates —
+      // hover picking or a visible tooltip card — or right after the camera
+      // moved (projectionDirtyRef), so an idle, non-hovered scene projects
+      // zero of the 1,590 nodes. graphGroup is at identity, so node local
+      // coordinates project directly.
+      const tooltipActive =
+        hoveredTopicRef.current !== null || touchPinnedTopicRef.current !== null;
+      if (mousePosRef.current || tooltipActive || projectionDirtyRef.current) {
+        for (let i = 0; i < currentNodes.length; i++) {
+          const node = currentNodes[i];
+          const projected = projectedCoords[i];
+          projected.visible = !hiddenSubjectsRef.current.has(node.topic.subject);
+          if (!projected.visible) continue;
 
-        tempV.set(node.x, node.y, node.z);
-        tempV.applyMatrix4(graphGroup.matrixWorld);
-        tempV.project(camera);
-        projected.sx = (tempV.x * 0.5 + 0.5) * cssW;
-        projected.sy = (-tempV.y * 0.5 + 0.5) * cssH;
-        projected.zDepth = tempV.z;
+          tempV.set(node.x, node.y, node.z);
+          tempV.project(camera);
+          projected.sx = (tempV.x * 0.5 + 0.5) * cssW;
+          projected.sy = (-tempV.y * 0.5 + 0.5) * cssH;
+          projected.zDepth = tempV.z;
+        }
+        projectionDirtyRef.current = false;
       }
 
       // Perform precise hover detection with camera depth priority
@@ -1073,8 +1275,8 @@ export default function ThreeDGraphCanvas({
 
         const ringNode = selTopic ? nodeByTopicIdRef.current.get(selTopic.id) : null;
         if (ringNode && selectionRingOpacityRef.current > 0.01) {
+          // graphGroup is at identity, so node local position == world position.
           ringWorldPos.set(ringNode.x, ringNode.y, ringNode.z);
-          ringWorldPos.applyMatrix4(graphGroup.matrixWorld);
           // Pulse disabled under reduced-motion (constant 1.0); the opacity
           // fade-in and size lift still convey selection without oscillation.
           const distScale = Math.max(0.78, Math.min(1.2, ringWorldPos.distanceTo(camera.position) / 320));
@@ -1096,8 +1298,8 @@ export default function ThreeDGraphCanvas({
       const tooltipEl = tooltipRef.current;
       if (tooltipEl) {
         if (currentHovered) {
-          const proj = projectedCoordsRef.current.find(p => p.visible && p.topic.id === currentHovered.id);
-          if (proj) {
+          const proj = projectedByTopicIdRef.current.get(currentHovered.id);
+          if (proj && proj.visible) {
             const hoverColor = subjectColor(currentHovered.subject);
             if (tooltipDotRef.current) tooltipDotRef.current.style.backgroundColor = hoverColor;
             if (tooltipMetaRef.current && tooltipMetaRef.current.dataset.id !== currentHovered.id) {
@@ -1153,11 +1355,28 @@ export default function ThreeDGraphCanvas({
     const handleResize = () => {
       const parentRect = containerRef.current?.getBoundingClientRect();
       if (parentRect) {
+        // Browser zoom and cross-monitor moves change devicePixelRatio without
+        // recreating the renderer; refresh the ratio (and the shader's copy)
+        // so discs stay CSS-px-identical and crisp at every zoom level. Guard
+        // on change — setPixelRatio reallocates the drawing buffer even when
+        // the value is identical, which ResizeObserver would fire repeatedly.
+        const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        if (renderer.getPixelRatio() !== pixelRatio) {
+          renderer.setPixelRatio(pixelRatio);
+          const pointsUniforms = pointsMaterialRef.current?.uniforms.uPixelRatio;
+          if (pointsUniforms) pointsUniforms.value = pixelRatio;
+        }
         renderer.setSize(parentRect.width, parentRect.height, false);
         camera.aspect = parentRect.width / parentRect.height;
         camera.updateProjectionMatrix();
         activeHardMaterial.resolution.set(parentRect.width, parentRect.height);
         activeSoftMaterial.resolution.set(parentRect.width, parentRect.height);
+        // Cache the canvas box for pointer handlers. The page never scrolls
+        // and the canvas fills its container, so refreshing on resize (and at
+        // setup) is sufficient — no per-event getBoundingClientRect.
+        const canvasBox = canvas.getBoundingClientRect();
+        canvasRectRef.current = { left: canvasBox.left, top: canvasBox.top };
+        projectionDirtyRef.current = true;
       }
     };
 
@@ -1166,6 +1385,18 @@ export default function ThreeDGraphCanvas({
     if (containerRef.current) {
       resizeObserver.observe(containerRef.current);
     }
+
+    // A DPR change without a CSS-size change (window dragged between displays)
+    // fires no resize event; watch the current ratio directly and re-arm the
+    // query on each change so it keeps firing for subsequent moves.
+    let dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    const onDprChange = () => {
+      handleResize();
+      dprQuery.removeEventListener("change", onDprChange);
+      dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      dprQuery.addEventListener("change", onDprChange);
+    };
+    dprQuery.addEventListener("change", onDprChange);
 
     // --- Unified pointer listeners (selection coexists with OrbitControls) ---
     let pointerCount = 0;
@@ -1186,6 +1417,8 @@ export default function ThreeDGraphCanvas({
         pointerDownType = e.pointerType;
         mousePosRef.current = null;
         framingAnimRef.current.active = false;
+        // Fresh screen-space coordinates for the eventual tap hit-test.
+        projectionDirtyRef.current = true;
         canvas.style.cursor = "grabbing";
       } else {
         multiTouch = true;
@@ -1196,8 +1429,17 @@ export default function ThreeDGraphCanvas({
     const onPointerMove = (e: PointerEvent) => {
       lastInteractionTime.current = Date.now();
       if (!pointerActiveRef.current) {
-        const rect = canvas.getBoundingClientRect();
-        mousePosRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        const rect = canvasRectRef.current;
+        if (rect) {
+          // Mutate in place — pointermove fires at input-device frequency and
+          // a fresh {x,y} per event only churns the minor GC.
+          if (mousePosRef.current) {
+            mousePosRef.current.x = e.clientX - rect.left;
+            mousePosRef.current.y = e.clientY - rect.top;
+          } else {
+            mousePosRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+          }
+        }
         return;
       }
       const dx = e.clientX - pointerDownPos.x;
@@ -1222,7 +1464,8 @@ export default function ThreeDGraphCanvas({
       const isTouch = pointerDownType === "touch";
       if (isTouch && Date.now() - pointerDownTime >= TAP_MAX_DURATION_MS) return;
 
-      const rect = canvas.getBoundingClientRect();
+      const rect = canvasRectRef.current;
+      if (!rect) return;
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
       const radiusSq = isTouch ? TAP_RADIUS_SQ_TOUCH : TAP_RADIUS_SQ_DESKTOP;
@@ -1276,7 +1519,8 @@ export default function ThreeDGraphCanvas({
     // default 3/4 camera. Touch surfaces do not emit dblclick reliably, so
     // touch keeps tap-to-toggle in the pointer handler above.
     const onDoubleClick = (e: MouseEvent) => {
-      const rect = canvas.getBoundingClientRect();
+      const rect = canvasRectRef.current;
+      if (!rect) return;
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
 
@@ -1315,6 +1559,7 @@ export default function ThreeDGraphCanvas({
     return () => {
       cancelAnimationFrame(animationFrameId);
       resizeObserver.disconnect();
+      dprQuery.removeEventListener("change", onDprChange);
 
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
@@ -1322,10 +1567,18 @@ export default function ThreeDGraphCanvas({
       canvas.removeEventListener("pointerleave", onPointerLeave);
       canvas.removeEventListener("dblclick", onDoubleClick);
 
+      controls.removeEventListener("change", onControlsChange);
       controls.dispose();
 
       pointsGeometry.dispose();
       pointsMaterial.dispose();
+      // Drop the refs too: under StrictMode's dev remount the next mount's
+      // kick effect runs before setup, and a dangling disposed geometry makes
+      // it fill dead buffers and clear the dirty flag before the real
+      // geometry ever gets its first attribute pass (nodes invisible on
+      // first load until hover/selection re-armed it).
+      pointsGeometryRef.current = null;
+      pointsMaterialRef.current = null;
 
       hardEdgesGeometry.dispose();
       hardEdgesMaterial.dispose();
@@ -1350,12 +1603,8 @@ export default function ThreeDGraphCanvas({
   const handleResetView = () => {
     framingAnimRef.current = {
       active: true,
-      targetPos: new THREE.Vector3(0, 0, 0),
-      targetCamPos: new THREE.Vector3(
-        DEFAULT_CAMERA_POSITION.x,
-        DEFAULT_CAMERA_POSITION.y,
-        DEFAULT_CAMERA_POSITION.z,
-      ),
+      targetPos: DEFAULT_TARGET_POS.clone(),
+      targetCamPos: DEFAULT_CAM_POS.clone(),
       targetDist: DEFAULT_CAMERA_DISTANCE,
     };
     lastInteractionTime.current = Date.now();
