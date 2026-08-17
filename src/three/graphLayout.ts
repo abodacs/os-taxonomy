@@ -9,17 +9,16 @@
  * tapered funnel that is narrow at the foundation (age 4) and wide at the
  * specialization canopy (age 15+).
  */
-export const FUNNEL_HEIGHT = 240; // total vertical span (y: -120 .. +120)
-export const FUNNEL_Y_MIN = -120; // bottom (age 4)
-export const FUNNEL_Y_MAX = 120; // top (age 15)
-export const FUNNEL_R_MAX = 125; // maximum radius at the top; keeps the canopy beside the editorial copy
-export const FUNNEL_R_FLOOR = 8; // small minimum so age-4 isn't a single point
-export const FUNNEL_EXPONENT = 1.2; // smooth funnel power curve
-export const FUNNEL_AGE_MIN = 4;
+const FUNNEL_HEIGHT = 240; // total vertical span (y: -120 .. +120)
+const FUNNEL_Y_MIN = -120; // bottom (age 4)
+const FUNNEL_R_MAX = 125; // maximum radius at the top; keeps the canopy beside the editorial copy
+const FUNNEL_R_FLOOR = 8; // small minimum so age-4 isn't a single point
+const FUNNEL_EXPONENT = 1.2; // smooth funnel power curve
+const FUNNEL_AGE_MIN = 4;
 // The source taxonomy's ageRangeStart tops out at 13 while its ranges extend
 // through 15. Treat that top band as the specialization canopy so the full
 // dataset uses the available vertical volume.
-export const FUNNEL_AGE_MAX = 13;
+const FUNNEL_AGE_MAX = 13;
 
 /**
  * Radial distance from the central Y-axis as a function of vertical position.
